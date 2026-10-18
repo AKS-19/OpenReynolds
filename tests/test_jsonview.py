@@ -226,7 +226,7 @@ def test_a_sink_that_went_away_ends_the_stream_and_not_the_study():
 
 def test_two_threads_writing_at_once_never_split_a_line():
     """`progress` comes from the tracker's thread, `delivered` and `mirrored` from the
-    mirror's, `desk` and `narration` from the concierge's. TuiView solves this with
+    mirror's, `side_answer` from the side chat's. TuiView solves this with
     call_from_thread; a writer to a stream has to hold a lock, and a half-written line
     is not a parse error a reader recovers from -- it silently rejoins mid-object."""
     sink = io.StringIO()
@@ -408,7 +408,9 @@ class FakeLoop:
         view.warn("the mirror skipped a file")
         view.info("the thread is intact")
         view.narration("writing the mesh dictionary")
-        view.desk("it is meshing; about two minutes left")
+        view.side_question("how long is left?")
+        view.side_answer("it is meshing; about two minutes left", False)
+        view.received("queued: the agent reads this at its next step.")
         view.interjection("use a finer mesh")
         view.status(["solving simpleFoam", "step 40 of 500"])
         view.show_files("/work/study-test", 1)

@@ -73,10 +73,16 @@ sets `OPENREYNOLDS_WORKSPACE_ETA_S`; thirty seconds is between a warm pool and a
 machine."""
 
 DEFAULT_DESK_MODEL = "claude-haiku-4-5"
-"""The front-desk model: a second, cheap agent that answers the user while the main
-agent is busy (`desk.py`). Haiku is ~5x cheaper than the Opus main model and fast
-enough to reply in seconds. Uses the same BYOK key. `OPENREYNOLDS_DESK_MODEL` overrides;
-`OPENREYNOLDS_DESK=0` turns it off entirely."""
+"""The model the front desk used to answer with: a second, cheap agent that replied to
+every message typed while the main agent was busy. That desk is gone (`desk.py` says
+why), and nothing in a session asks for this model any more.
+
+It is still read, written and switched like any other setting, on purpose. The hosted
+app stores a desk model beside every bring-your-own key and names one in the
+environment of every session it starts (`OPENREYNOLDS_DESK_MODEL`); config files on
+people's machines carry `desk_model`; and the presets use it to keep the cheap models
+out of the list `/model` offers (`presets.models_for`). Removing it here first would
+turn each of those into a setting this side refuses. It goes when they have."""
 
 CONTEXT_WINDOW_TOKENS = 1_000_000
 CONTEXT_REFRESH_FRACTION = 0.8
@@ -173,9 +179,12 @@ class Config:
     a flag has to be remembered every time, and the place it is most likely to be
     forgotten is the scheduled run nobody is watching."""
     desk: bool = True
-    """Whether the front-desk agent runs. It answers the user while the main agent is
-    mid-turn -- the difference between a message heard in seconds and one that waits
-    out a five-minute solve."""
+    """Whether `/btw <question>` is answered as a side question (`desk.SideChat`): the
+    main agent's last request sent once more with the question appended, answered
+    apart from the conversation and never added to it. `OPENREYNOLDS_DESK=0` turns it
+    off, and a `/btw` question is then answered with how to say it to the agent
+    instead. It used to switch the front desk, which answered every message typed
+    mid-turn with a cheaper model; nothing answers those automatically now."""
     desk_model: str = DEFAULT_DESK_MODEL
     mesher_model: str = ""
     """The model the CAD desk (`cad/`) builds geometry with. Empty means the preset's

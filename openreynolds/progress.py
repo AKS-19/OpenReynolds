@@ -493,9 +493,9 @@ class Tracker:
         self.store = store
         self.home = home
         self.local_dir = local_dir
-        self.concierge = None
-        """The front desk, told when the agent starts and stops working so it knows
-        whether the user is waiting on a busy agent. Set by the session; may be None."""
+        self._narrated = ""
+        """The last 'what's happening now' line said (`now_line`), so it is said again
+        only when it changes."""
         self._lock = threading.RLock()
         self._activity: Activity | None = None
         self._syncing_since: float | None = None
@@ -524,18 +524,12 @@ class Tracker:
         with self._lock:
             self._activity = activity
             self._tool_polled = 0.0
-        if self.concierge is not None:
-            self.concierge.working(kind != "waiting")
         self.push()
 
     def idle(self) -> None:
         """The session thread finished whatever it was doing."""
         with self._lock:
             self._activity = None
-            jobs = bool(self._jobs)
-        if self.concierge is not None:
-            # A running job still keeps the desk narrating; a bare idle does not.
-            self.concierge.working(jobs)
         self.push()
 
     # -- what the workspace says -----------------------------------------------
@@ -821,6 +815,54 @@ class Tracker:
             self._tick += 1
         try:
             self.view.progress(self.snapshot())
+        except Exception:  # noqa: BLE001 - presentation may not end a session
+            pass
+        self._narrate()
+
+    def now_line(self) -> str:
+        """What the agent is doing right now, in a few words and with no clock in it:
+        the job that leads the bar, else what the session thread is in, else nothing.
+
+        The 'what's happening now' line. A model used to write it -- the front desk,
+        every couple of minutes, from a slice of the transcript -- and it read well and
+        cost a request each time, and said nothing the bar did not already know. This
+        is the bar's own knowledge in words. It has no elapsed time in it so that it
+        changes when the work does rather than every second; the bar carries the clock."""
+        with self._lock:
+            activity = self._activity
+            jobs = list(self._jobs.values())
+            starting = self._workspace_since is not None
+        lead = next((j for j in jobs if j.fraction is not None), jobs[0] if jobs else None)
+        if lead is not None:
+            line = f"{lead.phase} {lead.name}".strip()
+            if len(jobs) > 1:
+                line += f" (+{len(jobs) - 1} more)"
+            if activity is not None and activity.kind not in ("waiting", "tool"):
+                line += f"; the agent is {activity.kind} meanwhile"
+            return line
+        if activity is None or activity.kind == "waiting":
+            return "waiting for the workspace to start" if starting else ""
+        if activity.kind == "tool":
+            exe = phase_from_cmd(activity.cmd)[1] if activity.label == "bash" else ""
+            what = f"{activity.label}: {exe}" if exe else activity.label
+            if starting:
+                return f"{what}, waiting for the workspace to start"
+            return f"running {what}"
+        return activity.kind
+
+    def _narrate(self) -> None:
+        line = self.now_line()
+        with self._lock:
+            if line == self._narrated:
+                return
+            self._narrated = line
+        if not line:
+            return
+        narrate = getattr(self.view, "narration", None)
+        if narrate is None:
+            return
+        try:
+            narrate(line)
         except Exception:  # noqa: BLE001 - presentation may not end a session
             pass
 

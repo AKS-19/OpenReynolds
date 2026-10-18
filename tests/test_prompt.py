@@ -224,17 +224,26 @@ def test_the_felix_prompt_says_nothing_of_openfoam_tooling():
 
 
 # -- before the solver is chosen (`--solver auto`) ------------------------------
+#
+# There is no prompt for a study still choosing any more: the choice is made by a
+# request of its own before the main agent's first (`desk.route`), and the main agent
+# starts on its solver's prompt. What the choosing prompt said about the two solvers
+# now lives in the routing request's prompt, and is held to the same facts here.
 
 
 def _choosing():
-    from openreynolds.prompt import SOLVER_CHOICE_PROMPT
+    from openreynolds.desk import ROUTING_SYSTEM
 
-    return SOLVER_CHOICE_PROMPT
+    return ROUTING_SYSTEM
 
 
-def test_a_study_with_no_solver_yet_gets_the_choosing_prompt():
-    assert system_prompt("auto") == _choosing()
-    assert _choosing() not in (SYSTEM_PROMPT, _felix())
+def test_a_study_with_no_solver_yet_is_never_sent_a_prompt_of_its_own():
+    """`auto` is settled before any request; asked anyway, it is OpenFOAM's prompt --
+    never a third prompt that a later request would have to swap out."""
+    assert system_prompt("auto") is SYSTEM_PROMPT
+    from openreynolds import prompt
+
+    assert not hasattr(prompt, "SOLVER_CHOICE_PROMPT")
 
 
 @pytest.mark.parametrize("pattern", IMPERATIVE_PATTERNS)
@@ -245,7 +254,6 @@ def test_the_choosing_prompt_mandates_no_workflow(pattern):
 
 def test_the_choosing_prompt_is_short_and_frozen():
     assert len(_choosing()) < 6000
-    assert system_prompt("auto") is system_prompt("auto")
     for volatile in ("instance_id", "{", "}"):
         assert volatile not in _choosing()
 
@@ -264,7 +272,7 @@ def test_the_choosing_prompt_is_short_and_frozen():
         ".vtu",                 # its mesh
         "GPU",
         "billed",
-        "does not change",      # the choice holds for the study
+        "holds for the whole study",  # the choice does not change
     ],
 )
 def test_the_choosing_prompt_says_what_each_solver_can_do(fact):

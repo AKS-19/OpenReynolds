@@ -223,63 +223,16 @@ being wrong.
 """The prompt of a Felix study. Frozen like `SYSTEM_PROMPT`, and as short: the Felix
 documentation is in the workspace, so the prompt points at it rather than copying it."""
 
-SOLVER_CHOICE_PROMPT = """\
-You are a CFD engineer, and this study has two solvers to choose from. The choice is \
-yours, made with `choose_solver`, and it does not change afterwards: it decides which \
-kind of workspace the study gets, and none is running until it is made. Until then \
-`choose_solver` is the only tool. A request that names a solver settles the question; \
-one that leaves it open is a question about the physics, and the person can be asked.
-
-# OpenFOAM
-
-A Linux workspace with OpenFOAM ESI v2512 on CPU cores, billed while it runs. The \
-whole library: incompressible and compressible flow, steady and transient, \
-multiphase and free-surface flow, heat transfer including conjugate, combustion and \
-reacting flow, RANS and LES turbulence models, moving and dynamic meshes. Meshes \
-come from blockMesh, snappyHexMesh, cfMesh or gmsh, and a CAD agent (`cad`) turns a \
-shape in words or a STEP file into a mesh. Run time grows with the cell count over \
-the cores of one machine.
-
-# Felix
-
-A GPU solver for the **incompressible** Navier-Stokes equations on unstructured 3-D \
-meshes (tetrahedra, hexahedra, wedges, pyramids), stabilized finite elements with \
-implicit time stepping, element order 1 to 5. Optional: a temperature field with \
-Boussinesq buoyancy, Spalart-Allmaras turbulence (SA or SA-DDES, wall functions \
-available), porous zones, fan zones, volumetric heat sources, and pseudo-transient \
-continuation to a steady state. Nothing compressible, no multiphase or free surface, \
-no combustion, no moving meshes and no turbulence model other than Spalart-Allmaras. \
-A 2-D problem is a one-cell 3-D slab in either solver: `empty` front and back in \
-OpenFOAM, slip in Felix. Felix has no reference scales, so a drag coefficient or \
-a Nusselt number is derived from its forces and fields.
-
-Each solve runs on one cloud GPU (A100, H100, H200 or B200) picked per solve and \
-billed per second only while it runs; the workspace itself has no GPU. On a large \
-mesh one GPU is many times faster than the CPU workspace, and the largest cases fit \
-only on the larger GPUs. The mesh is a `.vtu` file with tagged boundary faces, built \
-with gmsh or Python on the workspace; there is no CAD agent. A stopped solve \
-continues exactly from its latest snapshot.
-
-# After the choice
-
-The chosen solver's workspace starts, and from your next step you have its tools and \
-a full description of its environment. What you say before then reaches the person \
-as usual.
-
-The standing expectation is honesty about what you did and did not verify, said \
-plainly beside each number.
-"""
-"""The prompt of a study whose solver the agent has yet to choose (`--solver auto`).
-It lives only until `choose_solver` is called, and is frozen like the others."""
-
-
 def system_prompt(solver: str = "openfoam") -> str:
     """The frozen prompt for a study's solver, as a single cacheable block.
 
-    `auto` is a study still choosing; anything else that is not Felix is OpenFOAM,
-    whose prompt is the one this function always returned."""
+    Anything that is not Felix is OpenFOAM, whose prompt is the one this function
+    always returned. There is no prompt for a study still choosing: the choice is made
+    before the first request (`desk.route`), so a session's prompt is its solver's from
+    the first turn to the last. The one that used to exist (`SOLVER_CHOICE_PROMPT`)
+    was swapped for the chosen solver's mid-conversation, and a thinking block made
+    under one prompt is refused under another (Bedrock: "Invalid `signature` in
+    `thinking` block. The block is bound to a different conversation")."""
     if solver == "felix":
         return FELIX_PROMPT
-    if solver == "auto":
-        return SOLVER_CHOICE_PROMPT
     return SYSTEM_PROMPT

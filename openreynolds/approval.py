@@ -8,9 +8,11 @@ a JSON stream and the web page all answer it the same way.
 Only what is typed after the question is shown answers it: the loop drains the reader
 before every tool call (`Loop._gather`), so a line typed while the model was still
 streaming reaches the model as an interjection instead of silently declining a call
-nobody saw. Anything typed while a question is open is read as an answer to it, with two
+nobody saw. Anything typed while a question is open is read as an answer to it, with three
 exceptions: commands answered locally (`/status`, `/files`, `/help`, `/mode`...) are
-handled and the question stays open, and `/exit` declines and is put back for the
+handled and the question stays open; a side question (`/btw <question>`) goes to the
+side chat and the question stays open, since a side question is by definition not an
+answer to anything in the conversation; and `/exit` declines and is put back for the
 prompt to act on. Words that are not a yes, a no or an "all" are steering, so they
 decline the call and travel back to the model verbatim.
 """
@@ -72,11 +74,16 @@ def choices_for(kind: str) -> list[str]:
 class Approver:
     """Asks the person, reads their answer."""
 
-    def __init__(self, view: Any, reader: Any, local: Callable[[commands.Command], None] | None = None):
+    def __init__(self, view: Any, reader: Any, local: Callable[[commands.Command], None] | None = None,
+                 side: Callable[[str], None] | None = None):
         self.view = view
         self.reader = reader
         self.local = local
         """Answers a local command typed while a question is open (cli wires `_local`)."""
+        self.side = side
+        """Takes a side question typed while a question is open (`SideChat.ask`). None
+        when side questions are off: then `/btw <question>` is answered as `local` says
+        a side question is, and the question stays open either way."""
         self.open: str | None = None
         """The id of the question waiting for an answer, if any."""
 
@@ -122,8 +129,11 @@ class Approver:
             return None
         text = command.text.strip()
         if kind == commands.ASIDE:
-            # The aside wording is for the model's thread; the note carries what was typed.
-            text = line.strip().partition(" ")[2].strip()
+            if self.side is not None:
+                self.side(text)
+            elif self.local is not None:
+                self.local(command)
+            return None
         if not text:
             return None
         if kind == commands.SAY:

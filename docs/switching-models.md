@@ -31,8 +31,9 @@ goes over Anthropic's Messages API at `{service}/v1/llm`, anything else over Ope
 Responses API at `{service}/v1/llm/v1`, both on the service key (which cloud the service
 relays each to is its business). So `/model claude-opus-5-5` on a GPT session is a
 switch of client as well as of model, even though the provider, key and service are the
-same: the client is rebuilt at the next turn, the front desk moves from `gpt-6-luna` to
-`claude-haiku-4-5` (it always speaks the main model's family), and the window moves from
+same: the client is rebuilt at the next turn, the desk model setting moves from `gpt-6-luna`
+to `claude-haiku-4-5` (it always names the main model's family, though nothing in a
+session asks for it any more), and the window moves from
 GPT's 272,000 -- where those models start billing at a long-context rate the service
 does not price -- to Claude's 1,000,000. A switch within a family keeps the client.
 
@@ -147,12 +148,14 @@ with a model the service no longer meters is not restored as recorded, which wou
 Claude chose Claude, and anything else on the default -- says so, and the record is
 rewritten. A config file saved then loads the same way.
 
-### The mesh desk and the front desk
+### The mesh desk and the side chat
 
 The mesh desk reads the model at each `mesh` call, so it follows the switch unless
-`OPENREYNOLDS_MESHER_MODEL` pins it. The front desk, which answers quickly while the
-agent works, rebuilds its client on a provider change -- or on `reynolds`, a change of
-family -- and uses that provider's (or family's) desk model.
+`OPENREYNOLDS_MESHER_MODEL` pins it. The side chat (`/btw`) has no client of its own: it
+forks the loop's last request on the loop's provider, so it is on whichever model that
+request was -- the new one from the first request after the switch. The front desk that
+used to answer every mid-turn message with a desk model is gone; `desk_model` is still
+read and switched, for the configurations and the hosted app that set it.
 
 ## /effort
 

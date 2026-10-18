@@ -17,7 +17,7 @@ drift apart.
 OUT: one JSON object per line, each with `v` (schema), `type`, `at` (seconds since the
 view was made) and `study`. Every write goes through one lock and is flushed, because
 three of the methods below are called from other threads (`progress` from the tracker,
-`delivered`/`mirrored` from the mirror, `desk`/`narration` from the concierge). TuiView
+`delivered`/`mirrored` from the mirror, `side_answer` from the side chat). TuiView
 solves the same problem with `call_from_thread`; a writer to a stream has to solve it
 itself, and a half-written line is not a parse error a reader can recover from -- it
 silently rejoins the stream mid-object.
@@ -353,8 +353,14 @@ class JsonView(View):
     def narration(self, text: str) -> None:
         self.emit("narration", text=text)
 
-    def desk(self, text: str) -> None:
-        self.emit("desk", text=text)
+    def side_question(self, text: str) -> None:
+        self.emit("side_question", text=text)
+
+    def side_answer(self, text: str, forwarded: bool) -> None:
+        self.emit("side_answer", text=text, forwarded=bool(forwarded))
+
+    def received(self, text: str) -> None:
+        self.emit("receipt", text=text)
 
     def desk_step(self, event: dict[str, Any]) -> None:
         """One step of the CAD desk's work, the dict the transcript holds."""

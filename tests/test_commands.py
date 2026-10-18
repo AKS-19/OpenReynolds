@@ -61,12 +61,13 @@ def test_an_aside_keeps_what_was_said():
     assert "the inlet velocity looks like mm/s" in command.text
 
 
-def test_an_aside_is_framed_as_the_user_not_the_harness():
-    """The user typed `/btw`; this says what they meant by it. It is not an
-    instruction about how to work."""
-    text = parse("/btw carry on").text
-    assert text.startswith("By the way")
-    assert "harness" not in text.lower()
+def test_a_side_question_is_the_question_as_typed():
+    """`/btw` used to be framed for the model ("By the way, no need to stop what you
+    are doing: ..."); it is now a side question, answered apart, and the framing has
+    nobody to address. A plain message is how to tell the agent something."""
+    assert parse("/btw is it converging?").text == "is it converging?"
+    assert parse("/aside carry on").text == "carry on"
+    assert not hasattr(commands, "aside")
 
 
 def test_files_carries_the_path_asked_for():

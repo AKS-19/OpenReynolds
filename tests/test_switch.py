@@ -288,20 +288,6 @@ def test_a_reynolds_thread_crosses_families_through_neutral_blocks():
     assert "gAAAA" not in repr(rendered)
 
 
-def test_the_front_desk_follows_a_reynolds_switch_across_families(store, view):
-    from openreynolds import desk as desk_mod
-    from openreynolds.llm.anthropic_api import AnthropicProvider
-    from openreynolds.llm.responses_api import ResponsesProvider
-
-    cfg = Config(provider="reynolds", foamd_url="https://api.example", foamd_api_key="svc")
-    desk = desk_mod.Concierge(cfg, store, view)
-    assert desk.model == "gpt-6-luna" and isinstance(desk._provider, ResponsesProvider)
-    cfg.model, cfg.desk_model = "claude-sonnet-5-5", "claude-haiku-4-5"  # what `apply` does
-    desk._follow()
-    assert desk.model == "claude-haiku-4-5" and isinstance(desk._provider, AnthropicProvider)
-    assert str(desk._provider.client.base_url).rstrip("/") == "https://api.example/v1/llm"
-
-
 def test_the_cad_desk_and_reviewer_follow_a_reynolds_switch_across_families(store):
     from openreynolds import cad
     from openreynolds.llm.anthropic_api import AnthropicProvider
@@ -726,23 +712,28 @@ def test_model_and_effort_are_answered_locally(loop, store, seen, models):
     assert "outside a session" in seen.statuses[-1][0]
 
 
-def test_the_desk_follows_a_provider_change(store, view, monkeypatch):
-    from openreynolds import desk as desk_mod
+def test_the_side_chat_asks_the_provider_the_loop_has_now(ctx, store, view):
+    """The front desk kept a client of its own and had to follow a switch to it. The
+    side chat has none: it asks the loop's provider, on the request it forks, so a
+    switch the loop has applied is the one it uses, and one still pending is not."""
+    from openreynolds.desk import SideChat
+    from openreynolds.loop import Loop
 
-    cfg = Config(llm_api_key="k", desk_model="claude-haiku-4-5")
-    desk = desk_mod.Concierge(cfg, store, view)
-    built = []
+    loop = Loop(Config(llm_api_key="k", model="claude-opus-5-5"), ctx, store, view)
+    loop.say("go")
+    asked = []
 
-    def make(c, **kw):
-        built.append(c.provider)
-        return SimpleNamespace(complete=lambda **k: f"answer from {k['model']}", client=None)
+    class Provider:
+        def stream(self, **kwargs):
+            asked.append(kwargs["model"])
+            from openreynolds.llm import Turn
+            from openreynolds.llm.base import TextBlock
 
-    monkeypatch.setattr(desk_mod, "make_provider", make)
-    desk._call("s", "p", 10)
-    assert built == []  # nothing moved, nothing rebuilt
-    cfg.provider, cfg.llm_api_key, cfg.desk_model = "openai", "sk-o", "gpt-5-mini"
-    assert desk._call("s", "p", 10) == "answer from gpt-5-mini"
-    assert built == ["openai"]
+            return Turn(content=[TextBlock(text="ok")])
+
+    loop.provider = Provider()
+    SideChat(loop, view, deliver=lambda w, n: None).ask("which model?", wait=True)
+    assert asked == ["claude-opus-5-5"]
 
 
 def test_the_mesher_reads_the_model_at_each_run(store, monkeypatch):

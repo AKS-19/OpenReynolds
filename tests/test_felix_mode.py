@@ -606,24 +606,54 @@ def _study_dir(run):
     return only
 
 
-def test_solver_auto_starts_no_workspace_until_the_agent_chooses(monkeypatch, tmp_path):
-    from openreynolds.prompt import FELIX_PROMPT, SOLVER_CHOICE_PROMPT
+def test_solver_auto_routes_the_first_message_before_the_first_main_request(monkeypatch, tmp_path):
+    """The solver is settled by a request of its own, on the person's first message,
+    before the main agent's first request -- which already has the chosen solver's
+    prompt and tools. Nothing is reserved until the routing request has answered."""
+    from openreynolds import desk
+    from openreynolds.prompt import FELIX_PROMPT
 
     run = _auto_session(monkeypatch, tmp_path, [_choose("felix"), _done()])
 
     calls = run.loop.fake.calls
-    assert _names(calls[0]["tools"]) == ["choose_solver"], "the first decision is the solver"
-    assert _system_text(calls[0]) == SOLVER_CHOICE_PROMPT
+    assert _names(calls[0]["tools"]) == ["choose_solver"], "the routing request"
+    assert _system_text(calls[0]) == desk.ROUTING_SYSTEM
+    assert calls[0]["messages"] == [{"role": "user", "content": "go"}], "the person's words"
     assert len(run.reserves) == 1, "one workspace, reserved once"
-    assert run.reserves[0]["model_calls"] >= 1, "reserved only after the model chose"
+    assert run.reserves[0]["model_calls"] == 1, "reserved after routing, before the agent"
     assert run.reserves[0].get("solver") == "felix"
     assert run.platform.studies and run.platform.studies[0]["solver"] == "felix"
     assert run.platform.posted, "what was said before the choice still reaches the platform"
-    # The next request is a Felix study's.
+    # The main agent's first request is a Felix study's.
     assert _system_text(calls[1]) == FELIX_PROMPT
     names = _names(calls[1]["tools"])
     assert "choose_solver" not in names and "cad" not in names and "job_start" in names
     assert Store(run.cfg.studies_dir, _study_dir(run).name).session.solver == "felix"
+    # The reason reaches the person and the agent.
+    assert any("Felix, chosen from your first message" in n for n in run.view.notices)
+    briefing = calls[1]["messages"][0]["content"]
+    assert "chosen from the person's first message" in briefing
+    assert "the flow is incompressible and the mesh is large" in briefing
+
+
+def test_solver_auto_never_changes_the_prompt_or_tools_mid_conversation(monkeypatch, tmp_path):
+    """The rule the old design broke: every request of the main conversation carries
+    the same system prompt and the same tool list, from the first to the last. The
+    swap it made after `choose_solver` was a 400 on Bedrock (`desk.py`)."""
+    from conftest import message, tool_block
+
+    run = _auto_session(monkeypatch, tmp_path, [
+        _choose("felix"),
+        message([tool_block("bash", {"cmd": "ls"})], stop_reason="tool_use"),
+        message([tool_block("read_file", {"path": "/work"}, "tu_2")], stop_reason="tool_use"),
+        _done(),
+    ])
+
+    main = run.loop.fake.calls[1:]
+    assert len(main) >= 3
+    assert len({_system_text(call) for call in main}) == 1
+    assert all(call["tools"] == main[0]["tools"] for call in main)
+    assert all("choose_solver" not in _names(call["tools"]) for call in main)
 
 
 def test_solver_auto_choosing_openfoam_gives_the_openfoam_study(monkeypatch, tmp_path):
@@ -639,23 +669,27 @@ def test_solver_auto_choosing_openfoam_gives_the_openfoam_study(monkeypatch, tmp
     assert Store(run.cfg.studies_dir, _study_dir(run).name).session.solver == "openfoam"
 
 
-def test_solver_a_tool_not_offered_is_no_such_tool(monkeypatch, tmp_path):
-    """Before the choice only `choose_solver` is offered. A call to anything else is the
-    same answer as a call to a tool that does not exist -- the list is the mechanism, so
-    no gate and no wait on a workspace nobody has started."""
-    from conftest import message, tool_block
+def test_solver_a_routing_request_that_does_not_choose_is_openfoam_said_aloud(monkeypatch, tmp_path):
+    """No guess and no silence: the study is OpenFOAM's, and both the person and the
+    agent are told why."""
+    from conftest import message, text_block
+    from openreynolds.prompt import SYSTEM_PROMPT
 
-    stray = message([tool_block("bash", {"cmd": "ls"})], stop_reason="tool_use")
-    run = _auto_session(monkeypatch, tmp_path, [stray, _done()])
+    run = _auto_session(monkeypatch, tmp_path, [message([text_block("hmm")]), _done()])
 
-    assert run.reserves == [] and run.backend.execs == []
-    result = run.loop.fake.calls[1]["messages"][-1]["content"][0]
-    assert result["is_error"] and "No such tool: bash" in str(result["content"])
+    assert run.reserves and "solver" not in run.reserves[0]
+    assert any("could not be chosen" in n for n in run.view.notices)
+    calls = run.loop.fake.calls
+    assert _system_text(calls[1]) == SYSTEM_PROMPT
+    assert "OpenFOAM by default" in calls[1]["messages"][0]["content"]
 
 
-def test_solver_auto_session_that_never_chooses_starts_nothing(monkeypatch, tmp_path):
-    run = _auto_session(monkeypatch, tmp_path, [_done()])
+def test_solver_auto_session_nobody_speaks_in_starts_nothing(monkeypatch, tmp_path):
+    """A hosted study can be opened with no first message. It waits at the prompt, and
+    is routed on the first message typed; when none ever is, nothing was spent."""
+    run = _auto_session(monkeypatch, tmp_path, [_done()], lines=())
 
+    assert run.loop.fake.calls == []
     assert run.reserves == []
     assert run.platform.studies == []
     assert run.backend.execs == []
@@ -711,59 +745,20 @@ def test_solver_settles_from_the_record_and_the_flag(stored, asked, resuming, se
     assert cli._settle_solver(stored, asked, resuming=resuming, local=False) == settled
 
 
-# -- A3: tools before the choice ----------------------------------------------
+# -- A3: one tool list for the whole study ----------------------------------------
 
 
-@pytest.fixture
-def unchosen(ctx):
-    ctx.solver = "auto"
-    ctx.cad = object()
-    ctx.reviewer = object()
-    return ctx
-
-
-def test_tools_before_the_choice_only_the_choice_is_offered(unchosen):
-    assert _names(tools_for(unchosen)) == ["choose_solver"]
-    unchosen.mode = "structured"
-    assert _names(tools_for(unchosen)) == ["checkpoint", "choose_solver"]
-
-
-def test_tools_choose_solver_describes_both_solvers(unchosen):
-    tool = _tool(unchosen, "choose_solver")
-    assert "felix" in tool["input_schema"]["properties"]["solver"]["enum"]
-    assert "openfoam" in tool["input_schema"]["properties"]["solver"]["enum"]
-    assert set(tool["input_schema"]["required"]) == {"solver", "reason"}
-
-
-def test_tools_the_tool_list_is_the_only_mechanism_before_the_choice(unchosen, backend):
-    """design.md: the harness does not gate a call on policy. Before the choice the
-    machine tools are simply not offered; a call made anyway takes the path any call
-    takes, with no refusal of the harness's own."""
-    assert "bash" not in _names(tools_for(unchosen))
-    content, is_error = dispatch(unchosen, "bash", {"cmd": "ls"})
-    assert backend.execs == ["ls"] and not is_error
-    assert "choose_solver" not in str(content)
-
-
-def test_tools_choose_solver_fixes_the_solver_once(unchosen, store):
-    told = []
-    unchosen.on_solver = lambda solver: told.append(solver) or "the workspace is starting"
-
-    content, is_error = dispatch(unchosen, "choose_solver",
-                                 {"solver": "felix", "reason": "GPU"})
-    assert not is_error and "felix" in content
-    assert told == ["felix"]
-    assert unchosen.solver == "felix" and store.session.solver == "felix"
-    assert "choose_solver" not in _names(tools_for(unchosen))
-
-    content, _ = dispatch(unchosen, "choose_solver", {"solver": "openfoam", "reason": "x"})
-    assert unchosen.solver == "felix" and told == ["felix"], "it does not change"
-
-
-def test_tools_choose_solver_refuses_what_is_not_a_solver(unchosen):
-    content, _ = dispatch(unchosen, "choose_solver", {"solver": "fluent", "reason": "x"})
-    assert unchosen.solver == "auto"
-    assert "felix" in content and "openfoam" in content
+def test_tools_no_main_list_offers_the_solver_choice_and_every_one_offers_send_to_agent(ctx):
+    """The choice is routing's own tool now (`desk.ROUTE_TOOL`), never the agent's; and
+    `send_to_agent` is in every list from the first request, because the side chat
+    sends this list as it is (`desk.SideChat`)."""
+    for solver in ("openfoam", "felix", "auto"):
+        ctx.solver = solver
+        for mode in ("auto", "structured"):
+            ctx.mode = mode
+            names = _names(tools_for(ctx))
+            assert "choose_solver" not in names
+            assert "send_to_agent" in names
 
 
 # -- the seam the Felix log parser (A4) plugs into ------------------------------
@@ -809,9 +804,9 @@ def test_tools_a_felix_solve_reaches_the_progress_seam(monkeypatch, backend, sto
 # -- the interface an embedder (the web app) uses ------------------------------------
 
 
-def test_solver_an_embedder_that_names_none_leaves_it_to_the_agent(monkeypatch, tmp_path):
-    run = _auto_session(monkeypatch, tmp_path, [_done()], solver=None)
-    assert run.reserves == []
+def test_solver_an_embedder_that_names_none_has_it_routed(monkeypatch, tmp_path):
+    run = _auto_session(monkeypatch, tmp_path, [_choose("openfoam"), _done()], solver=None)
+    assert run.reserves and run.reserves[0]["model_calls"] == 1
     assert _names(run.loop.fake.calls[0]["tools"]) == ["choose_solver"]
 
 

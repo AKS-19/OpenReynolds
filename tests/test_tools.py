@@ -23,6 +23,7 @@ def test_tool_list_is_deterministic():
         "job_start",
         "mesh_review",
         "read_file",
+        "send_to_agent",
         "write_file",
     ]
     for tool in TOOLS:
