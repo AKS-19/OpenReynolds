@@ -139,4 +139,4 @@ EC2 workspace, staging felixd and Modal:
 
 | Run | Date | Result |
 |---|---|---|
-| | | |
+| CLI `20261018T025955Z` (study `20261018-025958-1cc6`, workspace AMI `ami-02dd22c5392f1af24`) | 2026-10-18 | 1, 3, 4, 5, 7, S4 pass as run. 2, 6 and both S3 checks failed on harness bugs: `find /work` printed `lost+found`'s permission error as the case path; S3 probed foamd's public address, which workspaces can't reach (they use `foamd.internal.…`), and counted the vendored felixclient docstring's example URL as a configured address. After the fix, all four pass on the same workspace and transcript (`recheck.json`): felix-check-mesh rc 0; centreline u 0.36% RMS from Ghia, with a plot; no felixd key prefix anywhere; the solver uid reaches internal foamd (200) and S3 but not felixd or example.com. 4 H100 solves, 3 killed (the person's stop among them) and 1 succeeded, 298.56¢; foamd = felixd = account. Web app (2): to do by a person. |
