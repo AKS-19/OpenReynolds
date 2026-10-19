@@ -141,3 +141,11 @@ EC2 workspace, staging felixd and Modal:
 |---|---|---|
 | CLI `20261018T025955Z` (study `20261018-025958-1cc6`, workspace AMI `ami-02dd22c5392f1af24`) | 2026-10-18 | 1, 3, 4, 5, 7, S4 pass as run. 2, 6 and both S3 checks failed on harness bugs: `find /work` printed `lost+found`'s permission error as the case path; S3 probed foamd's public address, which workspaces can't reach (they use `foamd.internal.…`), and counted the vendored felixclient docstring's example URL as a configured address. After the fix, all four pass on the same workspace and transcript (`recheck.json`): felix-check-mesh rc 0; centreline u 0.36% RMS from Ghia, with a plot; no felixd key prefix anywhere; the solver uid reaches internal foamd (200) and S3 but not felixd or example.com. 4 H100 solves, 3 killed (the person's stop among them) and 1 succeeded, 298.56¢; foamd = felixd = account. |
 | Web app, same prompt, Felix | 2026-10-18 | Pass. H100; 160 × 160 wall-clustered mesh with a thin spanwise-slip extrusion; mesh checks passed before solving; steady at step 1648. Centreline u 0.38% RMS from Ghia (15 interior points), 0.649% max; comparison plot, 17-point table and report in the outputs. GPU $0.856, including a timestep ramp the agent stopped itself and re-ran with a smaller step. No stop and resume by the person in this run. |
+
+## Prod smoke (`scripts/felix_smoke_prod.py`, foamd repo)
+
+One Felix solve on prod through foamd's API, no agent: a throwaway account gets a Felix workspace from the current launch template, checks first boot wrote `/etc/reynolds/felix.json`, runs `felix gpus` and a 40-step `cavity_smoke` solve on A100-80GB, and checks billing against felixd's cost. The account is deleted at the end.
+
+| Run | Date | Result |
+|---|---|---|
+| AMI `ami-0fe311d50458a2332`, `reynolds-prod/felix:prod` `sha256:aba419e6…` | 2026-10-19 | 5/5 pass. Workspace up in 82 s; `felix.json` points at `foamd.internal.tryreynolds.com`; GPUs A100-80GB, H100, H200, B200; solve succeeded, outputs back; 0.5488¢ in foamd = felixd, and the account shows it. Account deleted. |
