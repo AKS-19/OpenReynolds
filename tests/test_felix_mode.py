@@ -636,6 +636,42 @@ def test_solver_auto_routes_the_first_message_before_the_first_main_request(monk
     assert "the flow is incompressible and the mesh is large" in briefing
 
 
+def test_solver_routing_reads_as_the_agent_working_not_the_persons_turn(monkeypatch, tmp_path):
+    """The canary (production study 20261019-013223-f805): the first message was routed
+    in about 14 s, and for all of it the hosted page still showed the person's turn
+    from its idle prompt -- an MCP caller read "Reynolds has finished its turn" with an
+    empty transcript and ended the study. During the routing request the agent is the
+    one working, and the view says so before the request goes out."""
+    import conftest
+
+    seen = []
+    views = []
+    real_stream = conftest.FakeMessages.stream
+
+    def watching(self, **kwargs):
+        view = views[0] if views else None
+        seen.append((kwargs["tools"][0]["name"] if len(kwargs["tools"]) == 1 else "main",
+                     getattr(view, "whose", None), list(getattr(view, "working_on", []))))
+        return real_stream(self, **kwargs)
+
+    monkeypatch.setattr(conftest.FakeMessages, "stream", watching)
+    real_header = conftest.RecordingView.header
+
+    def header(self, *args, **kwargs):
+        views.append(self)
+        return real_header(self, *args, **kwargs)
+
+    monkeypatch.setattr(conftest.RecordingView, "header", header)
+
+    run = _auto_session(monkeypatch, tmp_path, [_choose("felix"), _done()])
+
+    routing = seen[0]
+    assert routing[0] == "choose_solver"
+    assert routing[1] == "agent", "the agent's move while the solver is chosen"
+    assert routing[2] == ["choosing the solver"]
+    assert run.view.prompts >= 1, "the idle prompt came first, as it does on the page"
+
+
 def test_solver_auto_never_changes_the_prompt_or_tools_mid_conversation(monkeypatch, tmp_path):
     """The rule the old design broke: every request of the main conversation carries
     the same system prompt and the same tool list, from the first to the last. The

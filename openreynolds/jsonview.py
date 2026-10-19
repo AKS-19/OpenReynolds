@@ -353,6 +353,9 @@ class JsonView(View):
     def narration(self, text: str) -> None:
         self.emit("narration", text=text)
 
+    def working(self, what: str) -> None:
+        self.emit("working", text=what)
+
     def side_question(self, text: str) -> None:
         self.emit("side_question", text=text)
 
