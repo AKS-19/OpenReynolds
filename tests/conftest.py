@@ -258,6 +258,16 @@ def an_openfoam_study_unless_told(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def retry_waits_are_instant(monkeypatch):
+    """A transient model failure is retried after a wait of seconds to minutes
+    (`llm.base.TRANSIENT_WAITS`). The suite's failures are scripted, so the waits are
+    skipped -- the `stop` question is still asked once, as a real wait would ask it."""
+    from openreynolds.llm import base
+
+    monkeypatch.setattr(base, "nap", lambda seconds, stop=lambda: False: not stop())
+
+
+@pytest.fixture(autouse=True)
 def drawing_starts_allowed():
     """`--output-format stream-json` gives up drawing inline images for the life of
     the process, because a pseudo-terminal answers `isatty()` the same way a person's

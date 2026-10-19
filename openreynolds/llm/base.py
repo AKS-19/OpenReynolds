@@ -16,6 +16,7 @@ turn from the neutral blocks and simply loses the parts only the original could 
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -29,6 +30,68 @@ class ProviderError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+TRANSIENT_STATUSES = frozenset({408, 409, 425, 429})
+"""The 4xx answers worth asking again: a timeout, a conflict, a rate limit. Every other
+4xx is about this account or this request -- the budget, the key, the model id -- and
+answers the same way in a minute. A 5xx, and a call the API never answered at all, are
+worth asking again too (`transient`)."""
+
+TRANSIENT_WAITS = (5.0, 15.0, 30.0, 60.0, 120.0)
+"""Seconds before each retry of a request that failed transiently: about four minutes
+in all, then the failure is the caller's to report.
+
+The SDK's own retries come first and give up within seconds, which is too soon for the
+limiter that ended five studies on 2026-10-19: foamd's per-key bucket
+(`too many requests; retry in 1s`), drained by two or three sessions on one account
+calling it at once. Its refill is steady, so a wait measured in tens of seconds finds
+it full where a second's does not. A turn that ended on it instead never resumed: with
+no job running there was nothing left to wake the agent, and the study sat in "your
+turn" with nothing said."""
+
+MAX_RETRY_AFTER = 300.0
+"""The most a `Retry-After` header may stretch one wait to."""
+
+
+def transient(exc: ProviderError) -> bool:
+    """Whether asking again could get a different answer."""
+    status = exc.status_code
+    return status is None or status >= 500 or status in TRANSIENT_STATUSES
+
+
+def retry_after(exc: BaseException) -> float | None:
+    """The `Retry-After` seconds of the SDK error a `ProviderError` was raised from,
+    when it had one. Every provider raises from the SDK's own error (`raise ... from
+    exc`), and the SDK's status errors keep the response."""
+    response = getattr(exc.__cause__, "response", None)
+    headers = getattr(response, "headers", None)
+    raw = headers.get("retry-after") if headers is not None else None
+    try:
+        return max(0.0, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        return None  # the HTTP-date form: the scheduled wait stands
+
+
+def retry_delay(exc: ProviderError, attempt: int,
+                waits: tuple[float, ...] = TRANSIENT_WAITS) -> float | None:
+    """How long to wait before asking again after `exc`, on retry number `attempt`
+    (0-based), or None when it should not be asked again: a refusal, or the waits
+    are spent. A server's `Retry-After` lengthens a wait, never shortens it."""
+    if not transient(exc) or attempt >= len(waits):
+        return None
+    return max(waits[attempt], min(retry_after(exc) or 0.0, MAX_RETRY_AFTER))
+
+
+def nap(seconds: float, stop: Callable[[], bool] = lambda: False) -> bool:
+    """Sleep `seconds`, a second at a time, unless `stop()` comes true first.
+    Returns whether the whole wait was slept."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        if stop():
+            return False
+        time.sleep(min(1.0, left))
+    return not stop()
 
 
 class BadRequest(ProviderError):

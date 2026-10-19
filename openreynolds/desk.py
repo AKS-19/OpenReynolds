@@ -68,6 +68,7 @@ from typing import Any, Callable
 
 from . import solvers
 from .llm import Listener, ProviderError
+from .llm import base as llm_base
 from .loop import MAX_TOKENS, _as_operator_text
 from .prompt import system_prompt
 from .tools import _clip, describe_job, dispatch, tools_for
@@ -154,6 +155,11 @@ class Route:
     tokens: dict[str, int] = field(default_factory=dict)
 
 
+ROUTE_WAITS = (5.0, 15.0, 30.0)
+"""Seconds before each retry of a routing request that failed transiently
+(`llm_base.retry_delay`): under a minute, then OpenFOAM by default, said so."""
+
+
 def route(provider: Any, model: str, said: str) -> Route:
     """Settle an open solver from what the person asked for. Never raises.
 
@@ -165,21 +171,33 @@ def route(provider: Any, model: str, said: str) -> Route:
     without a message), it does not guess: OpenFOAM, said so."""
     if not (said or "").strip():
         return Route(solvers.OPENFOAM, failed="there was no request to choose from")
-    try:
-        turn = provider.stream(
-            model=model,
-            system=ROUTING_SYSTEM,
-            messages=[{"role": "user", "content": said}],
-            tools=[ROUTE_TOOL],
-            effort=ROUTE_EFFORT,
-            max_tokens=ROUTE_MAX_TOKENS,
-            listener=Listener(),
-        )
-    except ProviderError as exc:
-        return Route(solvers.OPENFOAM, failed=f"the routing request failed: {exc.message or exc}")
-    except Exception as exc:  # noqa: BLE001 - a study must start whatever this did
-        return Route(solvers.OPENFOAM,
-                     failed=f"the routing request failed: {type(exc).__name__}: {exc}")
+    attempt = 0
+    while True:
+        try:
+            turn = provider.stream(
+                model=model,
+                system=ROUTING_SYSTEM,
+                messages=[{"role": "user", "content": said}],
+                tools=[ROUTE_TOOL],
+                effort=ROUTE_EFFORT,
+                max_tokens=ROUTE_MAX_TOKENS,
+                listener=Listener(),
+            )
+            break
+        except ProviderError as exc:
+            # A rate limit here used to settle the solver: OpenFOAM, for the whole
+            # study, because the limiter was busy for a second. Asked again first, on
+            # a shorter schedule than a turn's -- nothing has started yet, and the
+            # person is watching "choosing the solver".
+            delay = llm_base.retry_delay(exc, attempt, ROUTE_WAITS)
+            if delay is None:
+                return Route(solvers.OPENFOAM,
+                             failed=f"the routing request failed: {exc.message or exc}")
+            attempt += 1
+            llm_base.nap(delay)
+        except Exception as exc:  # noqa: BLE001 - a study must start whatever this did
+            return Route(solvers.OPENFOAM,
+                         failed=f"the routing request failed: {type(exc).__name__}: {exc}")
     call = next((c for c in turn.tool_calls if c.name == ROUTE_TOOL["name"]), None)
     chosen = solvers.normalize(str((call.input if call else {}).get("solver") or ""))
     if chosen not in solvers.SOLVERS:

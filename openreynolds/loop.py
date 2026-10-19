@@ -574,6 +574,18 @@ class Loop:
         self._gather()
         return bool(self._typed)
 
+    def take_typed(self) -> None:
+        """Put words `heard` gathered between turns into the thread as a user message.
+
+        Inside a turn they ride with the next batch's tool results. Between a failed
+        request and its retry (`cli._run_turn`) there is no batch to ride with, and
+        words left in `_typed` would wait for one that might never come."""
+        said = "\n".join(self._typed) or None
+        self._typed = []
+        if said:
+            self.view.interjection(said)
+            self.say(said)
+
     def _fell_back(self, response: Turn) -> None:
         """The model asked for declined this request and another answered it (or
         declined too): say so, and when one answered, make it the session's model.

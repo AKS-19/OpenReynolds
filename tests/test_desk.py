@@ -447,3 +447,41 @@ def test_routing_with_nothing_to_read_does_not_guess():
     provider = _Routing(_route_turn("felix"))
     chosen = desk.route(provider, "m", "   ")
     assert chosen.solver == solvers.OPENFOAM and chosen.failed and provider.calls == []
+
+
+class _Flaky(_Routing):
+    """Fails with `errors`, in order, and then answers."""
+
+    def __init__(self, turn, errors):
+        super().__init__(turn)
+        self.errors = list(errors)
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.errors:
+            raise self.errors.pop(0)
+        return self.turn
+
+
+def test_a_rate_limited_routing_request_is_asked_again_not_defaulted():
+    """2026-10-19: foamd's limiter answered a routing request 429, and the study would
+    have been OpenFOAM for good over a one-second wait."""
+    provider = _Flaky(_route_turn("felix"), [ProviderError("rate_limited", 429)] * 2)
+
+    chosen = desk.route(provider, "m", "a heated pipe")
+
+    assert len(provider.calls) == 3
+    assert (chosen.solver, chosen.failed) == ("felix", "")
+
+
+def test_routing_stops_asking_once_its_waits_are_spent():
+    provider = _Routing(error=ProviderError("rate_limited", 429))
+    chosen = desk.route(provider, "m", "a pipe")
+    assert len(provider.calls) == len(desk.ROUTE_WAITS) + 1
+    assert chosen.solver == solvers.OPENFOAM and "rate_limited" in chosen.failed
+
+
+def test_a_refused_routing_request_is_not_asked_again():
+    provider = _Routing(error=ProviderError("no budget", 402))
+    chosen = desk.route(provider, "m", "a pipe")
+    assert len(provider.calls) == 1 and chosen.solver == solvers.OPENFOAM

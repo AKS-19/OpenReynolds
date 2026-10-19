@@ -33,6 +33,7 @@ from .llm.presets import EFFORTS, context_window_for, desk_model_for, models_for
 from .config import Config, config_path
 from .delivery import Gallery
 from .llm import PRESETS, REYNOLDS, ProviderError, make_provider, preset_for
+from .llm import base as llm_base
 from .loop import Loop, forwarded_note
 from . import video as video_mod
 from .desk import OFF as SIDE_OFF, SideChat, route as route_solver, routed_line, routed_notice
@@ -3238,7 +3239,7 @@ def _open_folder(path: Path, view: View) -> None:
     view.info(f"opened {path}")
 
 
-RETRYABLE_MODEL_STATUSES = frozenset({408, 409, 425, 429})
+RETRYABLE_MODEL_STATUSES = llm_base.TRANSIENT_STATUSES
 """Model-API failures worth waking the model on again: a timeout, a conflict, a
 rate limit. Everything else the API answers with a 4xx is about this account or
 this request -- the budget, the key, the model id -- and answers the same way in a
@@ -3282,28 +3283,52 @@ def _run_turn(loop: Loop, view: View) -> bool:
     status: int | None = None
     said = ""
     exc_message = ""
-    try:
-        loop.run()
-        loop.api_failures = 0
-        loop.blocked_reason = None
-        loop.images_dropped = False
-        return True
-    except ProviderError as exc:
-        loop.api_failures += 1
-        status = exc.status_code
-        exc_message = exc.message or ""
-        if status:
-            said = f"The model API returned {status}: {exc.message}"
-        else:
-            said = f"Could not reach the model API: {exc.message}"
-        console.print()
-        console.print(f"[red]{said}[/]")
-        # The terminal sees the console; a web page sees the view. A refused call
-        # that only reached the console looked, on the page, like an agent that
-        # had gone quiet -- for ten minutes, to a person typing "what's going on?".
-        view.notice(said)
-
-    loop.settle()
+    attempt = 0
+    while True:
+        try:
+            loop.run()
+            loop.api_failures = 0
+            loop.blocked_reason = None
+            loop.images_dropped = False
+            return True
+        except ProviderError as exc:
+            status = exc.status_code
+            exc_message = exc.message or ""
+            if status:
+                said = f"The model API returned {status}: {exc.message}"
+            else:
+                said = f"Could not reach the model API: {exc.message}"
+            delay = llm_base.retry_delay(exc, attempt)
+            console.print()
+            console.print(f"[red]{said}[/]")
+            # The terminal sees the console; a web page sees the view. A refused call
+            # that only reached the console looked, on the page, like an agent that
+            # had gone quiet -- for ten minutes, to a person typing "what's going on?".
+            view.notice(said)
+        # The thread is answered up to where it stopped either way: a retry sends it
+        # again from there, and so does whatever comes after giving up.
+        loop.settle()
+        if delay is None:
+            break
+        # A rate limit, a timeout, a gateway: asked again here, after a wait, rather
+        # than ended. An ended turn is only resumed by something waking the loop --
+        # a person, a job finishing -- and on 2026-10-19 five studies had neither:
+        # each met foamd's limiter with nothing running, read "your turn" with
+        # nothing said, and stayed that way (`llm_base.TRANSIENT_WAITS`).
+        attempt += 1
+        waits = len(llm_base.TRANSIENT_WAITS)
+        console.print(f"[yellow]Trying again in {delay:g} s ({attempt} of {waits}).[/]")
+        # The agent's move, still: a page shows it working, and an MCP caller polling
+        # the study is not told the turn is over while it is only waiting to be retried.
+        view.working(f"model API busy - trying again in {delay:g} s ({attempt} of {waits})")
+        if llm_base.nap(delay, lambda: _spoke_or_left(loop)):
+            continue
+        if getattr(loop, "leaving", False):
+            break  # the person ended the session during the wait
+        # They said something: it goes in the thread, and the request goes now -- a
+        # person speaking is as good a moment to try again as any timer.
+        loop.take_typed()
+    loop.api_failures += 1
 
     # A 400 about an image is the one refusal this process can repair, because the
     # thing the API objected to is in a thread this process owns. Take the pictures
@@ -3353,6 +3378,14 @@ def _run_turn(loop: Loop, view: View) -> bool:
     else:
         view.info("the thread is intact - say something to continue, or /exit")
     return False
+
+
+def _spoke_or_left(loop: Any) -> bool:
+    """Whether a wait between retries should end: the person said something, or ended
+    the session. Asked the way a held tool wait asks (`Loop.heard`, `Loop.leaving`):
+    the drain answers commands on the spot and keeps words for the model."""
+    heard = getattr(loop, "heard", None)
+    return bool(heard is not None and heard()) or bool(getattr(loop, "leaving", False))
 
 
 FAILED_TURN = "The model request failed, so this turn ended: {said}"
