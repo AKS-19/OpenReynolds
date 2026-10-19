@@ -418,6 +418,11 @@ class RecordingView(View):
         self.side_questions = []
         self.side_answers = []
         self.receipts = []
+        self.working_on = []
+        self.whose = None
+        """Whose move a hosted page would show, from the calls that set it there
+        (`WebView`): the person's at a prompt, the agent's from `working` or the first
+        streamed thought."""
         self.solvers = []
         self.deliveries = []
         self.rendered = []
@@ -427,6 +432,7 @@ class RecordingView(View):
         self.headers.append((study_id, instance_id, model, mirror))
 
     def thinking_begin(self):
+        self.whose = "agent"
         self.thinking.append("<begin>")
 
     def thinking_delta(self, text):
@@ -490,6 +496,7 @@ class RecordingView(View):
         self.mirrors.append(report)
 
     def prompt(self):
+        self.whose = "user"
         self.prompts += 1
 
     def progress(self, snapshot):
@@ -509,6 +516,10 @@ class RecordingView(View):
 
     def received(self, text):
         self.receipts.append(text)
+
+    def working(self, what):
+        self.whose = "agent"
+        self.working_on.append(what)
 
     def solver(self, name):
         self.solvers.append(name)

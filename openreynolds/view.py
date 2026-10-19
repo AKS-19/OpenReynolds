@@ -98,6 +98,13 @@ class View(Protocol):
         tool calls, and a turn that took three rounds looks like one that took
         thirty. Facts only: which round, how long, how many calls."""
 
+    def working(self, what: str) -> None:
+        """The session is busy on the agent's behalf before any model output exists --
+        choosing the solver, for one (`Loop._route`). It is the agent's move, not the
+        person's: a view that shows whose turn it is shows the agent's, with `what` as
+        its stage. Not a draft -- nothing is streaming. The default is the stage line."""
+        self.stage(what)
+
     def interjection(self, text: str) -> None:
         """Something the user said that will reach the model without stopping it."""
 

@@ -57,6 +57,9 @@ LEFT_MID_TURN = (
 the model. In the harness's voice (`tell`): the person did not say it, and the model
 did not decide it."""
 
+ROUTING_STAGE = "choosing the solver"
+"""What the view and the bar say while an open solver is being routed (`Loop._route`)."""
+
 NOT_RUN_LEFT = "This call did not run: the person ended the session."
 """The result of a tool call the model asked for and the turn did not start, because the
 person had left by the time it was reached. The shape `settle` gives an interrupted
@@ -347,11 +350,14 @@ class Loop:
             from . import switch
 
             switch.apply(self)
-        if getattr(self.ctx, "solver", None) == solvers.AUTO and self.router is not None:
-            self._route()
+        # Running from here, routing included: the routing request is this turn's
+        # first wait, and a turn that is choosing its solver is a turn in flight -- to
+        # the side chat's `forward`, and to anything asking whether the agent is busy.
         with self._posted_lock:
             self.running = True
         try:
+            if getattr(self.ctx, "solver", None) == solvers.AUTO and self.router is not None:
+                self._route()
             return self._turns()
         finally:
             with self._posted_lock:
@@ -372,7 +378,19 @@ class Loop:
             "",
         )
         router, self.router = self.router, None
-        briefing = router(said)
+        # Said, because nothing else is: the routing request and the workspace's
+        # reservation take seconds -- 14 in the first production study routed this way
+        # (20261019-013223-f805) -- before the first streamed token, which is what used
+        # to tell a view the agent was working. Without this the hosted page still read
+        # "your turn" from its idle prompt, an MCP caller polling it was told the
+        # agent had finished its turn with nothing in the transcript, and ended the
+        # study. A stage and the bar, not a draft: no model output is on its way yet.
+        self.view.working(ROUTING_STAGE)
+        self._busy(ROUTING_STAGE)
+        try:
+            briefing = router(said)
+        finally:
+            self._unbusy()
         if briefing:
             self.messages.insert(0, {"role": "user", "content": briefing})
             self._record("event", briefing)

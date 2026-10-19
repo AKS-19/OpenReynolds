@@ -430,6 +430,7 @@ three cases exit code `1` alone cannot tell apart. In between:
 | `jobs` | Every job and its state, whenever any of it changes. |
 | `progress` | What is running and how far along, when the picture changes. |
 | `stage` / `narration` / `status` | What is happening now, in words. `narration` is made from the job and tool in flight, with no model call. |
+| `working` | The session is busy on the agent's behalf before any model output exists -- `text` says what, e.g. `choosing the solver` while an open solver is routed. It is the agent's move, not yours. |
 | `receipt` | A message typed while the agent is mid-turn was queued: `text` says it reaches the agent at its next step and what the agent is doing until then. |
 | `side_question` / `side_answer` | A `/btw` side question (`text`), and its answer (`text`, and `forwarded`: whether the person's words were also passed on to the agent). Never part of the conversation. |
 | `desk_step` | One step of the CAD desk's work while the `cad` tool runs, or the independent reviewer's verdict on it (`kind` is `cell` or `review`): `step`, `text` (the desk's own sentence, or the verdict), `cmd`, `exit_code`, `seconds`, `image`. The same object is an `event` row in the study's transcript. |
