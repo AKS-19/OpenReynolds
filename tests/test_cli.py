@@ -2202,3 +2202,106 @@ def test_the_join_notice_says_nothing_about_others_when_there_is_only_one():
         assert "another session may be using it" in notice
         assert "workspaces" not in notice
         assert "--instance" not in notice
+
+
+# -- a transient failure is asked again ---------------------------------------
+
+
+def _failing_then(loop, errors):
+    """`loop.run` raising each of `errors` in turn, then completing."""
+    calls = []
+    errors = list(errors)
+
+    def run():
+        calls.append(1)
+        if errors:
+            raise errors.pop(0)
+
+    loop.run = run
+    return calls
+
+
+def test_a_rate_limited_turn_is_retried_rather_than_ended(loop, view, store, quiet_console):
+    """2026-10-19: five studies met foamd's limiter (`429 rate_limited ... retry in 1s`)
+    with no job running. Each turn ended, nothing was left to wake the agent, and every
+    one of them sat in "your turn" with nothing said until it was ended by hand."""
+    calls = _failing_then(loop, [_api_error(429), _api_error(503), _api_error(None)])
+
+    assert cli._run_turn(loop, view) is True
+    assert len(calls) == 4
+    assert loop.api_failures == 0 and loop.blocked_reason is None
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert not any(e.startswith("The model request failed") for e in events), \
+        "a turn that went through is not recorded as failed"
+
+
+def test_a_retried_turn_says_it_is_still_the_agents_move(loop, view, quiet_console, monkeypatch):
+    working = []
+    monkeypatch.setattr(view, "working", working.append, raising=False)
+    _failing_then(loop, [_api_error(429)])
+
+    assert cli._run_turn(loop, view) is True
+    assert working and "trying again" in working[0]
+
+
+def test_retries_end_once_the_waits_are_spent(loop, view, store, quiet_console):
+    from openreynolds.llm import base
+
+    calls = _failing_then(loop, [_api_error(429)] * 99)
+
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == len(base.TRANSIENT_WAITS) + 1
+    assert loop.api_failures == 1, "one failed turn, however many tries it took"
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert sum(e.startswith("The model request failed") for e in events) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 413])
+def test_a_refusal_is_not_retried(loop, view, quiet_console, status):
+    calls = _failing_then(loop, [_api_error(status)] * 99)
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == 1
+
+
+def test_leaving_during_a_retry_wait_stops_the_retries(loop, view, quiet_console):
+    calls = _failing_then(loop, [_api_error(429)] * 99)
+    loop.leaving = True
+
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == 1
+
+
+def test_words_typed_during_a_retry_wait_reach_the_thread(loop, view, quiet_console):
+    calls = _failing_then(loop, [_api_error(429)])
+    typed = ["are you still there?"]
+
+    def heard():
+        if typed:
+            loop._typed.append(typed.pop())
+        return bool(loop._typed)
+
+    loop.heard = heard
+    loop.say("go")
+
+    assert cli._run_turn(loop, view) is True
+    assert len(calls) == 2
+    assert loop.messages[-1] == {"role": "user", "content": "are you still there?"}
+
+
+def test_retry_after_lengthens_a_wait_but_never_shortens_it():
+    from types import SimpleNamespace
+    from openreynolds.llm import ProviderError, base
+
+    def raised(after):
+        cause = Exception()
+        cause.response = SimpleNamespace(headers={"retry-after": after})
+        exc = ProviderError("rate_limited", 429)
+        exc.__cause__ = cause
+        return exc
+
+    assert base.retry_delay(raised("1"), 0) == base.TRANSIENT_WAITS[0]
+    assert base.retry_delay(raised("90"), 0) == 90
+    assert base.retry_delay(raised("99999"), 0) == base.MAX_RETRY_AFTER
+    assert base.retry_delay(raised("Wed, 21 Oct 2026 07:28:00 GMT"), 1) == base.TRANSIENT_WAITS[1]
+    assert base.retry_delay(ProviderError("x", 429), len(base.TRANSIENT_WAITS)) is None
+    assert base.retry_delay(ProviderError("x", 402), 0) is None
