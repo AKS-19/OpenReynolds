@@ -13,7 +13,7 @@ from it, so a command cannot exist in one and be missing from another.
 
 | Command | Also | What it does |
 | --- | --- | --- |
-| `/btw <something>` | `/bytheway`, `/aside` | Say something without asking the agent to stop. Your words reach it at its next step, marked as an aside. On its own, `/btw` is `/status`. |
+| `/btw <question>` | `/bytheway`, `/aside` | A side question, modeled on Claude Code's: answered now, from a fork of the agent's last request (same model, prompt, tools and messages, so it reads the conversation from the prompt cache), apart from the conversation -- nothing about it is added to the agent's thread, and the agent is not interrupted. The side answer may read a file or a job's log, and when you ask for something to be done it passes your words, as you wrote them, to the agent at its next step (`send_to_agent`). It cannot stop or approve anything. A plain message is how to tell the agent something; on its own, `/btw` is `/status`. |
 | `/status` | `/what` | What is happening right now: jobs, thread size, tokens and cache, last sync. Answered by the harness; the agent is not told and no model call is made. |
 | `/files [path]` | `/ls` | List the study's directory on the workspace, or the path you give. |
 | `/renders` | `/pics`, `/images` | Show the pictures folder, newest first. |

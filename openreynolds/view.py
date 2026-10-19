@@ -139,13 +139,37 @@ class View(Protocol):
         something to show -- a job, a slow tool, a sync -- hidden otherwise."""
 
     def narration(self, text: str) -> None:
-        """One plain-language line on what the agent is doing right now, from the
-        front desk. This is the 'what is happening' line, distinct from the model's
-        own reasoning peek."""
+        """One plain-language line on what the agent is doing right now, said when it
+        changes. Built by the tracker from what it already knows -- the job running,
+        the tool in flight (`progress.Tracker.now_line`) -- with no model call and no
+        clock in it, so it changes when the work does. Distinct from the model's own
+        reasoning peek."""
 
-    def desk(self, text: str) -> None:
-        """The front desk answering the user while the main agent is mid-turn.
-        Shown as speech, clearly attributed to the desk and not the agent."""
+    def side_question(self, text: str) -> None:
+        """The person asked a side question (`/btw <question>`); its answer is coming.
+        Not a message to the agent and not part of the conversation: a view shows it
+        apart, beside the answer that follows."""
+
+    def side_answer(self, text: str, forwarded: bool) -> None:
+        """The side chat's answer to the last side question (`desk.SideChat`): words
+        only, never added to the conversation. `forwarded` says the person's words were
+        also passed on to the agent, which reads them at its next step.
+
+        Shown apart from the transcript. The default is the old front desk's speech
+        where a view still has it -- the hosted page's did, before side questions --
+        so the answer is shown there as the desk's replies were; else an info line."""
+        desk = getattr(self, "desk", None)
+        if desk is not None:
+            desk(text)
+        else:
+            self.info(text)
+
+    def received(self, text: str) -> None:
+        """A message typed while the agent is mid-turn has been queued for it: the
+        receipt, said at once (`cli._receipt`) -- the agent reads it at its next step,
+        what it is doing now and for how long, and `/btw` for a question that does not
+        wait. The default is an info line."""
+        self.info(text)
 
     def desk_step(self, event: dict[str, Any]) -> None:
         """One step of the CAD desk's work, or the reviewer's verdict on it, as the
@@ -177,8 +201,8 @@ class View(Protocol):
 
     def solver(self, solver: str) -> None:
         """The study's solver, `openfoam` or `felix`: at the start when it is known,
-        else the moment the agent chooses it (`choose_solver`). Said once; it does
-        not change."""
+        else the moment it is chosen from the person's first message, before the
+        agent's first turn (`desk.route`). Said once; it does not change."""
 
 
 MAX_LISTED = 300
@@ -452,8 +476,19 @@ class ConsoleView(View):
             self._narration = text
             self.console.print(f"[dim italic]  - {text}[/]", highlight=False)
 
-    def desk(self, text: str) -> None:
-        self.console.print(f"\n[bold cyan]desk[/] [cyan]{text}[/]", highlight=False)
+    def side_question(self, text: str) -> None:
+        self.console.print(f"\n[bold cyan]btw[/] [cyan]{escape(text)}[/]  "
+                           "[dim](a side question: answered apart, the agent carries on)[/]",
+                           highlight=False)
+
+    def side_answer(self, text: str, forwarded: bool) -> None:
+        self.console.print(f"[bold cyan]side[/] [cyan]{escape(text)}[/]", highlight=False)
+        if forwarded:
+            self.console.print("[dim]  (passed on to the agent in your words; it reads "
+                               "them at its next step)[/]", highlight=False)
+
+    def received(self, text: str) -> None:
+        self.console.print(f"[dim]  {escape(text)}[/]", highlight=False)
 
     def desk_step(self, event: dict[str, Any]) -> None:
         """One line per step of the CAD desk's work, in the conversation, dim: the

@@ -10,8 +10,11 @@ they asked to have gated and nothing else.
 
 - `partial` puts every `job_start` call to the person before it runs. That is the call
   that spends compute; everything else runs freely.
-- `structured` offers a `checkpoint` tool and holds `job_start` until a checkpoint (a
-  plan) has been approved since the session entered the mode.
+- `structured` makes the `checkpoint` tool put its question to the person, and holds
+  `job_start` until a checkpoint (a plan) has been approved since the session entered
+  the mode. The tool is in the list in every mode -- the list may not change
+  mid-conversation -- and the switch itself reaches the model as a harness note
+  (`switched`, `Loop.set_mode`); the system prompt never mentions the mode.
 
 What the modes gate is decided here, in one place, so the loop, the briefing, the help
 text and the docs cannot drift apart on it.
@@ -146,8 +149,9 @@ def switched(mode: str) -> str:
             "The person switched this session to structured mode. They want to agree a "
             "plan at a checkpoint and to see a checkpoint after each stage ("
             + ", ".join(STAGES)
-            + "). The checkpoint tool is offered from the next request, and job_start "
-            "calls are held until a checkpoint has been approved."
+            + "). From the next tool call the checkpoint tool puts its summary to them "
+            "and waits for their answer, and job_start calls are held until a "
+            "checkpoint has been approved."
         )
     return (
         "The person switched this session to full auto mode. No tool call is put to "

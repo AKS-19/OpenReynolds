@@ -415,6 +415,10 @@ class RecordingView(View):
         self.progresses = []
         self.narrations = []
         self.desk_replies = []
+        self.side_questions = []
+        self.side_answers = []
+        self.receipts = []
+        self.solvers = []
         self.deliveries = []
         self.rendered = []
         self.browser = None
@@ -496,6 +500,18 @@ class RecordingView(View):
 
     def desk(self, text):
         self.desk_replies.append(text)
+
+    def side_question(self, text):
+        self.side_questions.append(text)
+
+    def side_answer(self, text, forwarded):
+        self.side_answers.append((text, forwarded))
+
+    def received(self, text):
+        self.receipts.append(text)
+
+    def solver(self, name):
+        self.solvers.append(name)
 
     @property
     def said(self) -> str:

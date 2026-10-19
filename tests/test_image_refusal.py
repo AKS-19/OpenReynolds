@@ -116,6 +116,7 @@ def _loop_with(messages):
 
     loop = _Loop(messages)
     loop.drop_images = Loop.drop_images.__get__(loop, _Loop)
+    loop._unbind_after = Loop._unbind_after.__get__(loop, _Loop)
     return loop
 
 

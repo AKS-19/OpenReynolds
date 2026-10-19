@@ -6,6 +6,44 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A session's system prompt and tool list no longer change mid-conversation.** A study
+  whose solver is `auto` used to start the agent on a solver-choosing prompt with only
+  `choose_solver`, and swap both once it was called; through the service's Bedrock
+  proxy the next request was a 400 (a thinking block is bound to the prompt and tools
+  it was made under) and the turn ended with nothing said. The solver is now chosen
+  from the person's first message by a request of its own, before the agent's first
+  turn (`desk.route`); the agent starts on that solver's prompt and tools, and the
+  choice and its reason are told to the person and in the briefing. A routing request
+  that fails leaves the study on OpenFOAM, said so. `choose_solver`,
+  `SOLVER_CHOICE_PROMPT` and the swap are gone.
+- **`/btw <question>` is a side question.** Answered by a fork of the agent's last
+  request -- same model, prompt, tools, settings and messages, one message appended, so
+  it reads the conversation from the prompt cache -- and never added to the
+  conversation. It may run `read_file`, a non-waiting `job_check` and `send_to_agent`,
+  which passes the person's own words to the agent at its next step; any other call is
+  not run. `send_to_agent` is in every tool list for that reason. Bare `/btw` is still
+  `/status`; the "By the way, no need to stop" framing is gone.
+- **The front desk is gone.** Nothing answers a mid-turn message in the agent's place.
+  A message typed mid-turn gets a receipt at once (queued, what the agent is doing and
+  for how long, `/btw` for a side question), held waits ask after the person every
+  second rather than every five, and the "what's happening now" line is built from the
+  tracker's job facts with no model call. `desk_model` is still read and switched, for
+  the configurations and the hosted app that set it.
+- **`/mode` no longer changes the tool list.** `checkpoint` is in every mode's list and
+  answers outside structured mode that checkpoints are structured mode's; the switch
+  reaches the model as a harness note, as it already did. The system prompt never
+  carried the mode. Structured mode still holds `job_start` until a plan is approved.
+- **Reasoning blocks follow what they are bound to.** Measured with the binding checked
+  strictly: a thinking block is bound to the system prompt, the tools and the messages
+  before it (an edited earlier message is the same 400; effort and model changes are
+  not). Image eviction and `drop_images` rewrite an earlier message, so the turns after
+  it lose their thinking blocks; a `/model` switch that rebuilds the client strips them
+  even when the model id is unchanged.
+- **A failed model request is in the transcript.** A turn a provider error ended leaves
+  an `event` row saying the request failed and why, not only a live notice.
+
 ### Added
 
 - **Felix mode: a second solver.** `--solver auto|openfoam|felix` (or

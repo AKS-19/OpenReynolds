@@ -1024,8 +1024,10 @@ class TuiView(View):
         self._to("activity", f"[dim]{'-' * 8} step {number}  {calls}  {seconds:.0f}s[/dim]")
 
     def interjection(self, text: str) -> None:
-        """The input box already showed what was typed; this confirms it was carried."""
-        self._to("conversation", "[dim](sent - it reads this at its next step)[/dim]")
+        """The input box already showed what was typed, and the receipt said it was
+        queued (`received`); this confirms it reached the agent, with the results of
+        the step it was typed during."""
+        self._to("conversation", "[dim](delivered - the agent has it now)[/dim]")
 
     def workspace(self, browser: Any) -> None:
         """Hand the interface a way to look at the workspace, and fill the pane once.
@@ -1084,10 +1086,23 @@ class TuiView(View):
         except RuntimeError:
             pass
 
-    def desk(self, text: str) -> None:
-        """A front-desk reply, in the conversation pane, clearly the desk and not
-        the agent -- so nobody reads it as the agent having answered."""
-        self._to("conversation", f"\n[bold cyan]desk[/bold cyan]  {_escape(text)}")
+    def side_question(self, text: str) -> None:
+        """A `/btw` question: in the conversation pane, marked as a side question so it
+        is not read as a message the agent will answer."""
+        self._to("conversation", f"\n[bold cyan]btw[/bold cyan]  {_escape(text)}  "
+                                 "[dim](side question: answered apart, the agent "
+                                 "carries on)[/dim]")
+
+    def side_answer(self, text: str, forwarded: bool) -> None:
+        """The side chat's answer, attributed to it and not to the agent."""
+        line = f"[bold cyan]side[/bold cyan]  {_escape(text)}"
+        if forwarded:
+            line += "\n[dim](passed on to the agent in your words; it reads them at its next step)[/dim]"
+        self._to("conversation", line)
+
+    def received(self, text: str) -> None:
+        """The receipt for a message typed mid-turn, under it in the conversation."""
+        self._to("conversation", f"[dim]{_escape(text)}[/dim]")
 
     def desk_step(self, event: dict[str, Any]) -> None:
         """One step of the CAD desk's work, in the conversation pane where the person

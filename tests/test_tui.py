@@ -704,13 +704,15 @@ async def test_the_now_line_shows_the_desks_narration():
         assert "near-wake mesh" in app.query_one("#now", NowPane).text
 
 
-async def test_a_desk_reply_lands_in_the_conversation_labelled():
+async def test_a_side_question_and_its_answer_land_in_the_conversation_labelled():
     app = idle_app()
     async with running(app) as pilot:
         view = TuiView(app)
-        await asyncio.to_thread(view.desk, "the agent is 20% through the solve, about 19 min left")
+        await asyncio.to_thread(view.side_question, "how far along is it?")
+        await asyncio.to_thread(view.side_answer, "about 20% through the solve", True)
+        await asyncio.to_thread(view.received, "queued: the agent reads this at its next step.")
         await pilot.pause()
-    # It reached the conversation pane (no exception); attribution is in the markup.
+    # They reached the conversation pane (no exception); attribution is in the markup.
 
 
 # -- completion in the prompt ----------------------------------------------------

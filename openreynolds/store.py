@@ -152,8 +152,7 @@ class Store:
                         roles: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """The last few transcript rows, oldest-first.
 
-        The concierge reads these to answer the user without a turn from the main
-        thread. Append-only, so reading the tail never races an appending writer:
+        Read from other threads than the one writing. Append-only, so reading the tail never races an appending writer:
         a half-written final line is dropped rather than raised on.
 
         `roles` keeps the last `limit` rows **of those roles** rather than the last
