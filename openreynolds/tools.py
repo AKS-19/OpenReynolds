@@ -19,10 +19,11 @@ and says whether it is the shape that was asked for. It is a second opinion abou
 one somebody uploaded -- and it changes nothing. Like `cad`, it is in the list only when
 there is a reviewer to serve it.
 
-A tenth, `checkpoint`, exists only when the person chose structured mode (`modes.py`):
-it puts a summary in front of them and waits for their answer. It is the person asking
-to be consulted, not the harness deciding to consult them, so in full auto it is not in
-the list at all.
+A tenth, `checkpoint`, is structured mode's (`modes.py`): there it puts a summary in
+front of the person and waits for their answer, the person asking to be consulted
+rather than the harness deciding to. It is in the list in every mode, because the list
+may not change mid-conversation, and outside structured mode it answers that
+checkpoints are structured mode's and puts nothing to anyone.
 
 `send_to_agent` is in every list and is not the main agent's at all. It is the side
 chat's (`desk.SideChat`): a `/btw` question is answered by the main agent's own last
@@ -208,11 +209,17 @@ def tools_for(ctx: ToolContext) -> list[dict[str, Any]]:
     sub-agent beats the bash the caller already has. With both wired the list is
     `TOOLS` itself, the same object every call, so the cache prefix does not move.
 
-    `checkpoint` is the other: it is offered only in structured mode. A `/mode` switch
-    into or out of structured therefore changes the tool list once, which rewrites the
-    prompt cache from position 0 once; that is the price of the person's choice and it
-    is paid only when they make it. Sorted by name either way, so the list for a given
-    mode is always the same bytes.
+    Neither of those can change during a session: the desk and the reviewer are built
+    once, before the first request, and the solver is fixed. Nothing else is
+    conditional. `checkpoint` used to be -- offered only in structured mode, so a
+    `/mode` switch into or out of it changed the tool list mid-conversation, which
+    rewrote the prompt cache from position 0 and, worse, invalidated every thinking
+    block in the thread: a thinking block is bound to the system prompt, the tool
+    list and the messages before it, and a provider that checks the binding (Bedrock,
+    or Anthropic's API with `prefix_mismatch_behavior: "error"`) refuses the next
+    request with a 400. It is now in every list, in every mode, and answers outside
+    structured mode that checkpoints are structured mode's (`_checkpoint`); the mode
+    itself reaches the model as a harness note (`Loop.set_mode`).
     """
     withheld = set()
     if ctx.cad is None:
@@ -234,9 +241,7 @@ def tools_for(ctx: ToolContext) -> list[dict[str, Any]]:
         offered = TOOLS if not withheld else [
             tool for tool in TOOLS if tool["name"] not in withheld
         ]
-    if ctx.mode != "structured":
-        return offered
-    return sorted([*offered, CHECKPOINT_TOOL], key=lambda tool: tool["name"])
+    return offered
 
 
 FRESH_SHELL = (
@@ -588,7 +593,6 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 
 FELIX_FRESH_SHELL = (
@@ -678,10 +682,11 @@ CHECKPOINT_TOOL: dict[str, Any] = {
     "name": "checkpoint",
     "description": (
         "Put where the study stands in front of the person and wait for their answer. "
-        "Offered because they chose structured mode: they want to agree a plan, and to "
-        "hear from you after each stage. The result says whether they approved, and "
-        "carries their words when they asked for changes. job_start calls are held "
-        "until a checkpoint has been approved in this mode."
+        "Only in structured mode, which the person chooses when they want to agree a "
+        "plan and hear from you after each stage; in any other mode nothing is put to "
+        "them and the result says so. The result says whether they approved, and "
+        "carries their words when they asked for changes. In structured mode job_start "
+        "calls are held until a checkpoint has been approved."
     ),
     "input_schema": {
         "type": "object",
@@ -706,8 +711,15 @@ CHECKPOINT_TOOL: dict[str, Any] = {
         "required": ["stage", "summary", "next"],
     },
 }
-"""Kept out of `TOOLS`: that list is what every mode offers, and this is structured
-mode's alone (`tools_for`)."""
+"""In every list, every mode (`tools_for`): a tool list that changed with `/mode` was a
+mid-conversation change to what the thread's thinking blocks are bound to."""
+
+for _offered in (TOOLS, FELIX_TOOLS):
+    # In place, so `TOOLS` and `FELIX_TOOLS` stay the objects `tools_for` hands back --
+    # the same object every request -- and stay sorted by name.
+    _offered.append(CHECKPOINT_TOOL)
+    _offered.sort(key=lambda tool: tool["name"])
+TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 
 ToolResult = str | list[dict[str, Any]]
@@ -2038,8 +2050,9 @@ def _checkpoint(ctx: ToolContext, args: dict[str, Any]) -> str:
     summary = str(args.get("summary") or "").strip()
     after = str(args.get("next") or "").strip()
     if ctx.mode != "structured":
-        return (f"The session is in {ctx.mode} mode, not structured mode, so this "
-                "checkpoint was not put to the person.")
+        return (f"Checkpoints apply only in structured mode, and this session is in "
+                f"{ctx.mode} mode, so nothing was put to the person. They can switch "
+                "with /mode structured.")
     if ctx.approver is None:
         return "Nobody is here to answer, so this checkpoint was not put to anyone."
     detail = summary + (f"\n\nnext: {after}" if after else "")

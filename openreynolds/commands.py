@@ -308,8 +308,8 @@ def _modes_topic() -> list[str]:
         "spends compute. bash, read_file, write_file, fetch, job_check, job_kill and "
         "cad run freely. Answer /yes, /no <reason> or /all (approve and switch to "
         "auto for the rest of the session).",
-        "structured gives the agent a checkpoint tool. Each checkpoint shows you a "
-        "summary and what comes next, and waits for your answer: /yes carries on, "
+        "structured makes the agent's checkpoint tool put its questions to you. Each "
+        "checkpoint shows you a summary and what comes next, and waits for your answer: /yes carries on, "
         "anything else goes back as the changes you want. job_start is held until you "
         "have approved a first checkpoint, the plan.",
     ]

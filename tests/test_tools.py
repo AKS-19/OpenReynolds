@@ -17,6 +17,7 @@ def test_tool_list_is_deterministic():
     assert names == [
         "bash",
         "cad",
+        "checkpoint",
         "fetch",
         "job_check",
         "job_kill",
@@ -44,28 +45,29 @@ def test_the_cad_tool_says_what_comes_back_and_what_does_not():
         assert imperative not in lowered, imperative
 
 
-def test_the_checkpoint_tool_is_offered_only_in_structured_mode(ctx):
-    """Nine tools in every mode; a tenth, `checkpoint`, only when the person chose
-    structured mode. Still sorted, so a mode's tool list is always the same bytes."""
+def test_the_tool_list_is_the_same_object_in_every_mode(ctx):
+    """`checkpoint` used to be offered only in structured mode, so `/mode` changed the
+    tool list mid-conversation -- and with it what every thinking block in the thread
+    is bound to. It is in the list in every mode now, and the list is one object."""
     from openreynolds.tools import tools_for
 
     ctx.cad = object()
     ctx.reviewer = object()
-    for mode in ("auto", "partial"):
+    lists = []
+    for mode in ("auto", "partial", "structured", "auto"):
         ctx.mode = mode
-        assert "checkpoint" not in [tool["name"] for tool in tools_for(ctx)]
-    ctx.mode = "structured"
-    names = [tool["name"] for tool in tools_for(ctx)]
-    assert names == sorted(names)
-    assert names == sorted([tool["name"] for tool in TOOLS] + ["checkpoint"])
-    assert tools_for(ctx) == tools_for(ctx)
+        lists.append(tools_for(ctx))
+    assert all(offered is TOOLS for offered in lists)
+    names = [tool["name"] for tool in TOOLS]
+    assert "checkpoint" in names and names == sorted(names)
 
 
 def test_a_checkpoint_outside_structured_mode_asks_nobody(ctx):
     asked = []
     ctx.approver = type("A", (), {"ask": lambda self, *a: asked.append(a)})()
     content, is_error = dispatch(ctx, "checkpoint", {"stage": "plan", "summary": "s", "next": "n"})
-    assert not asked and "not put to the person" in content
+    assert not asked and "nothing was put to the person" in content
+    assert "only in structured mode" in content and "/mode structured" in content
 
 
 def test_a_checkpoint_approved_with_all_switches_to_full_auto(ctx):

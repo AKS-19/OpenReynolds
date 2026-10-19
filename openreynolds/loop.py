@@ -306,8 +306,12 @@ class Loop:
 
         Takes effect at the next tool call: `_consult` reads `ctx.mode` every time.
         Entering structured mode starts it afresh, so a plan has to be approved in it
-        before compute is spent. The model is told in the harness's voice, because the
-        tool list and what gets held both change under it."""
+        before compute is spent. The model is told in the harness's voice, as a note in
+        a user turn (`tell`), because what gets held and what `checkpoint` does change
+        under it. Nothing else does: the system prompt never mentions the mode, and the
+        tool list is the same in every mode (`tools_for`) -- a list that changed here
+        would invalidate every thinking block in the thread on a provider that checks
+        what they are bound to."""
         canonical = modes.normalize(mode)
         if canonical is None:
             return None
@@ -621,7 +625,7 @@ class Loop:
         """
         image_results = []
         carried = 0
-        for message in self.messages:
+        for at, message in enumerate(self.messages):
             if message.get("role") != "user":
                 continue
             content = message.get("content")
@@ -634,7 +638,7 @@ class Loop:
                 if isinstance(inner, list) and any(
                     isinstance(b, dict) and b.get("type") == "image" for b in inner
                 ):
-                    image_results.append(block)
+                    image_results.append((at, block))
                     carried += _image_bytes(inner)
         # Nothing is evicted while the thread is under the byte budget. Every eviction
         # rewrites a block in the middle of the conversation and so invalidates the
@@ -642,7 +646,10 @@ class Loop:
         # picture of a study, to save re-reading tokens that cost a tenth as much.
         if carried <= LIVE_IMAGE_BUDGET:
             return
-        for block in image_results[: max(0, len(image_results) - keep)]:
+        evicted = image_results[: max(0, len(image_results) - keep)]
+        if evicted:
+            self._unbind_after(evicted[0][0])
+        for _, block in evicted:
             inner = block["content"]
             note = next(
                 (b.get("text", "") for b in inner if isinstance(b, dict) and b.get("type") == "text"),
@@ -906,10 +913,34 @@ class Loop:
                     out.append(block)
             return out
 
-        for message in self.messages:
+        first = None
+        for at, message in enumerate(self.messages):
             if isinstance(message, dict):
+                before = dropped
                 message["content"] = clean(message.get("content"))
+                if dropped > before and first is None:
+                    first = at
+        if first is not None:
+            self._unbind_after(first)
         return dropped
+
+    def _unbind_after(self, index: int) -> None:
+        """Take the reasoning blocks out of every assistant turn after `index`, the
+        first message about to be rewritten.
+
+        A thinking block is bound to everything before it -- the system prompt, the
+        tool list and the messages. Measured against Anthropic's API with the binding
+        checked strictly (`prefix_mismatch_behavior: "error"`, which is how Bedrock
+        behaves): a thread replayed with an earlier user message edited is refused,
+        `400 messages.1.content.0: Invalid signature in thinking block. The block is
+        bound to a different conversation`, and the same thread with that block taken
+        out goes through. Image eviction and `drop_images` both rewrite an earlier
+        message, so the turns after it lose their reasoning blocks -- the words and
+        tool calls beside them stay, which is what carries the reasoning forward.
+        Blocks before the rewritten message keep their prefix and are kept."""
+        from . import switch
+
+        switch.strip_thinking(self.messages[index + 1:])
 
     def restart(self, blurb: str) -> None:
         """Begin a fresh thread from a factual situation blurb."""

@@ -278,7 +278,11 @@ def apply(loop: Any) -> bool:
         if isinstance(pins, dict):
             pins.clear()
     loop.window = cfg.context_window or CONTEXT_WINDOW_TOKENS
-    if model_changed:
+    if model_changed or rebuild:
+        # A reasoning block is signed by the deployment that wrote it. Another model
+        # cannot use it, and neither can the same model id behind another endpoint --
+        # a vendor's own API and a gateway or the service's Bedrock proxy in front of
+        # the same family -- so a new client is a new start for reasoning too.
         strip_thinking(loop.messages)
     loop.store.session.model = cfg.model
     # With the model, because neither is worth anything without the other: a resume

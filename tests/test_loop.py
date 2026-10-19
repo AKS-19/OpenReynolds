@@ -813,3 +813,42 @@ def test_folding_leaves_every_other_message_byte_identical(ctx, store, view):
 
     folded = loop._fold_system({"role": "system", "content": "a fact"})
     assert folded["role"] == "user" and "a fact" in folded["content"]
+
+
+def test_rewriting_an_earlier_message_takes_the_reasoning_out_of_every_turn_after_it(
+    ctx, store, view, monkeypatch
+):
+    """A thinking block is bound to everything before it. Measured with the binding
+    checked strictly (Anthropic's `prefix_mismatch_behavior: "error"`, Bedrock's
+    behaviour): an earlier message edited, the block after it is a 400; the block taken
+    out, the request goes through. Image eviction edits an earlier message."""
+    from types import SimpleNamespace
+
+    from openreynolds import loop as loop_mod
+
+    monkeypatch.setattr(loop_mod, "LIVE_IMAGE_BUDGET", 0)
+    loop = Loop(Config(llm_api_key="k", model="claude-opus-5-5"), ctx, store, view)
+
+    def thought(name):
+        return SimpleNamespace(type="thinking", thinking=name, signature="sig")
+
+    def picture(tid):
+        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x" * 10}},
+            {"type": "text", "text": f"render {tid}"}]}]}
+
+    use = lambda tid: SimpleNamespace(type="tool_use", id=tid, name="read_file", input={})
+    loop.messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [thought("before"), use("a")]},
+        picture("a"),
+        {"role": "assistant", "content": [thought("after"), use("b")]},
+        picture("b"),
+    ]
+
+    loop._evict_old_images(keep=1)
+
+    assert loop.messages[2]["content"][0]["content"].startswith("[image no longer in context")
+    kinds = lambda m: [getattr(b, "type", None) or b.get("type") for b in m["content"]]
+    assert kinds(loop.messages[1]) == ["thinking", "tool_use"], "its prefix did not move"
+    assert kinds(loop.messages[3]) == ["tool_use"], "its prefix did"

@@ -31,6 +31,16 @@ All notable changes to this project are recorded here. The format follows
   second rather than every five, and the "what's happening now" line is built from the
   tracker's job facts with no model call. `desk_model` is still read and switched, for
   the configurations and the hosted app that set it.
+- **`/mode` no longer changes the tool list.** `checkpoint` is in every mode's list and
+  answers outside structured mode that checkpoints are structured mode's; the switch
+  reaches the model as a harness note, as it already did. The system prompt never
+  carried the mode. Structured mode still holds `job_start` until a plan is approved.
+- **Reasoning blocks follow what they are bound to.** Measured with the binding checked
+  strictly: a thinking block is bound to the system prompt, the tools and the messages
+  before it (an edited earlier message is the same 400; effort and model changes are
+  not). Image eviction and `drop_images` rewrite an earlier message, so the turns after
+  it lose their thinking blocks; a `/model` switch that rebuilds the client strips them
+  even when the model id is unchanged.
 - **A failed model request is in the transcript.** A turn a provider error ended leaves
   an `event` row saying the request failed and why, not only a live notice.
 
