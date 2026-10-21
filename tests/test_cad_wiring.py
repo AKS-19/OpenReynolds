@@ -259,12 +259,14 @@ def test_every_captured_name_is_captured_wherever_it_sits(tmp_path, name):
 # -- the tool ------------------------------------------------------------------
 
 
-def test_the_tool_names_are_exactly_the_sorted_nine_with_cad_second():
-    """Nine since the reviewer was offered on its own as `mesh_review`; `mesh`, the
-    desk's old name, is still not one of them."""
+def test_the_tool_names_are_exactly_the_sorted_eleven_with_cad_second():
+    """Nine since the reviewer was offered on its own as `mesh_review`; ten since the
+    side chat's `send_to_agent` joined every list (`desk.SideChat`), and eleven since
+    `checkpoint` is in every mode's (`tools_for`). `mesh`, the desk's old name, is still
+    not one of them."""
     names = [tool["name"] for tool in TOOLS]
     assert names == sorted(names)
-    assert len(names) == 9
+    assert len(names) == 11
     assert names[:2] == ["bash", "cad"]
     assert "mesh" not in names and "mesh_review" in names
 
@@ -365,7 +367,7 @@ def desk(ctx, monkeypatch):
     from openreynolds.cad import agent
 
     recorder = Recorder()
-    monkeypatch.setattr(agent, "make_provider", lambda cfg: recorder)
+    monkeypatch.setattr(agent, "make_provider", lambda cfg, **kw: recorder)
     ctx.cad = agent.CadDesk(Config(), ctx.backend, ctx.store, HOME)
     return recorder
 
@@ -524,6 +526,30 @@ def test_none_of_these_are_persisted_and_that_has_not_changed(clean_env, monkeyp
     cfg = Config.load()
     written = json.loads(cfg.save().read_text())
     assert "mesher_model" not in written and "cad_model" not in written
+
+
+def test_the_hosted_desk_builds_with_the_conversations_model(clean_env, monkeypatch):
+    """What the hosted app exports for a default session: the Reynolds provider and its
+    default GPT. No GPT has been swept on the desk at that version, so the preset names
+    no CAD model of its own and the desk builds with the main one."""
+    monkeypatch.setenv("OPENREYNOLDS_PROVIDER", "reynolds")
+    monkeypatch.setenv("OPENREYNOLDS_MODEL", "gpt-6.1-sol")
+    cfg = Config.load()
+    assert cfg.model == "gpt-6.1-sol"
+    assert cfg.mesher_model == ""
+
+
+def test_a_named_cad_model_still_wins_on_the_hosted_preset(clean_env, monkeypatch):
+    monkeypatch.setenv("OPENREYNOLDS_PROVIDER", "reynolds")
+    monkeypatch.setenv("OPENREYNOLDS_CAD_MODEL", "gpt-6-astra")
+    assert Config.load().mesher_model == "gpt-6-astra"
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_other_providers_keep_building_with_the_main_model(clean_env, monkeypatch,
+                                                           provider):
+    monkeypatch.setenv("OPENREYNOLDS_PROVIDER", provider)
+    assert Config.load().mesher_model == ""
 
 
 # -- the prompt ----------------------------------------------------------------

@@ -240,6 +240,34 @@ def refusing_to_reserve(error=None):
 
 
 @pytest.fixture(autouse=True)
+def an_openfoam_study_unless_told(monkeypatch, request):
+    """A session with no solver given leaves it to the agent (`--solver auto`), which
+    reserves no workspace until the model has chosen. The suite's sessions are about
+    everything else, written against an OpenFOAM study whose workspace is reserved at
+    the start, so that is the solver they get -- through the same environment variable
+    an embedder sets. `tests/test_felix_mode.py` clears it where the choice is the
+    subject."""
+    monkeypatch.setenv("OPENREYNOLDS_SOLVER", "openfoam")
+    # A resume of a study this machine has never held asks the platform for its
+    # solver before reserving. No test has a platform behind that question, so the
+    # answer is "no such study", which leaves the solver to the record and the flag.
+    # The Felix tests answer it themselves, and test the real question.
+    if request.node.module.__name__ != "test_felix_mode":
+        monkeypatch.setattr("openreynolds.backend.hosted.study_solver",
+                            lambda *args, **kwargs: (None, True), raising=False)
+
+
+@pytest.fixture(autouse=True)
+def retry_waits_are_instant(monkeypatch):
+    """A transient model failure is retried after a wait of seconds to minutes
+    (`llm.base.TRANSIENT_WAITS`). The suite's failures are scripted, so the waits are
+    skipped -- the `stop` question is still asked once, as a real wait would ask it."""
+    from openreynolds.llm import base
+
+    monkeypatch.setattr(base, "nap", lambda seconds, stop=lambda: False: not stop())
+
+
+@pytest.fixture(autouse=True)
 def drawing_starts_allowed():
     """`--output-format stream-json` gives up drawing inline images for the life of
     the process, because a pseudo-terminal answers `isatty()` the same way a person's
@@ -397,6 +425,15 @@ class RecordingView(View):
         self.progresses = []
         self.narrations = []
         self.desk_replies = []
+        self.side_questions = []
+        self.side_answers = []
+        self.receipts = []
+        self.working_on = []
+        self.whose = None
+        """Whose move a hosted page would show, from the calls that set it there
+        (`WebView`): the person's at a prompt, the agent's from `working` or the first
+        streamed thought."""
+        self.solvers = []
         self.deliveries = []
         self.rendered = []
         self.browser = None
@@ -405,6 +442,7 @@ class RecordingView(View):
         self.headers.append((study_id, instance_id, model, mirror))
 
     def thinking_begin(self):
+        self.whose = "agent"
         self.thinking.append("<begin>")
 
     def thinking_delta(self, text):
@@ -468,6 +506,7 @@ class RecordingView(View):
         self.mirrors.append(report)
 
     def prompt(self):
+        self.whose = "user"
         self.prompts += 1
 
     def progress(self, snapshot):
@@ -478,6 +517,22 @@ class RecordingView(View):
 
     def desk(self, text):
         self.desk_replies.append(text)
+
+    def side_question(self, text):
+        self.side_questions.append(text)
+
+    def side_answer(self, text, forwarded):
+        self.side_answers.append((text, forwarded))
+
+    def received(self, text):
+        self.receipts.append(text)
+
+    def working(self, what):
+        self.whose = "agent"
+        self.working_on.append(what)
+
+    def solver(self, name):
+        self.solvers.append(name)
 
     @property
     def said(self) -> str:

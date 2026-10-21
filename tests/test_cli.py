@@ -1531,56 +1531,100 @@ def test_the_interactive_loop_tells_the_bar_when_it_is_waiting(
     assert bar.kinds[0] == "waiting"
 
 
-# -- the front desk ------------------------------------------------------------
+# -- no front desk: plain messages are the agent's, side questions are apart ------
 
 
-class FakeDesk:
+class FakeSide:
+    """Stands in for `desk.SideChat`."""
+
     def __init__(self):
         self.asked = []
-        self.working_states = []
 
-    def ask(self, text):
+    def ask(self, text, wait=False):
         self.asked.append(text)
 
-    def working(self, yes=True):
-        self.working_states.append(yes)
 
-
-def test_a_message_typed_mid_turn_goes_to_both_the_model_and_the_desk(
+def test_a_message_typed_mid_turn_goes_to_the_model_and_nothing_answers_for_it(
     loop, backend, store, view
 ):
-    """The screenshot bug: mid-turn text reached the model (eventually) but nothing
-    answered now. It must now also reach the desk."""
-    desk = FakeDesk()
+    """The front desk used to answer it with a cheaper model as well. Now it is the
+    agent's alone; the screen says at once that it is queued."""
+    side = FakeSide()
     reader = ScriptedReader(["how long will this take?"])
 
-    handed = cli._typed_while_working(loop, view, Browser(backend, store), store, reader, concierge=desk)
+    handed = cli._typed_while_working(loop, view, Browser(backend, store), store, reader, side=side)
 
-    assert handed == "how long will this take?"  # still goes to the model
-    assert desk.asked == ["how long will this take?"]  # and to the desk, now
-
-
-def test_a_local_command_mid_turn_does_not_reach_the_desk(loop, backend, store, view):
-    desk = FakeDesk()
-    reader = ScriptedReader(["/status"])
-
-    cli._typed_while_working(loop, view, Browser(backend, store), store, reader, concierge=desk)
-
-    assert desk.asked == []  # /status is answered locally; the desk is for questions
+    assert handed == "how long will this take?"
+    assert side.asked == [] and view.desk_replies == []
+    assert view.receipts and view.receipts[0].startswith("queued")
 
 
-def test_typing_during_a_job_reaches_the_desk_too(loop, backend, store, view, quiet_console):
+def test_a_local_command_mid_turn_reaches_neither(loop, backend, store, view):
+    side = FakeSide()
+    cli._typed_while_working(loop, view, Browser(backend, store), store,
+                             ScriptedReader(["/status"]), side=side)
+    assert side.asked == [] and view.receipts == []
+
+
+def test_a_side_question_during_a_job_goes_to_the_side_chat_not_the_model(
+    loop, backend, store, view, quiet_console
+):
     backend.job_start("sleep 600", name="solve")
     store.record_job("job-1", cmd="sleep 600", name="solve")
-    install_model(loop, [message([text_block("stopping")])])
-    desk = FakeDesk()
+    fake = install_model(loop, [message([text_block("stopping")])])
+    side = FakeSide()
 
     cli._run_interactive(
         loop, backend, store, view, Browser(backend, store),
-        ScriptedReader(["what is it doing?", "/exit"]), concierge=desk,
+        ScriptedReader(["/btw what is it doing?", "/exit"]), side=side,
     )
 
-    assert "what is it doing?" in desk.asked
+    assert side.asked == ["what is it doing?"]
+    assert fake.calls == [], "no turn was started for it"
+
+
+def test_a_side_question_at_the_prompt_starts_no_turn(loop, backend, store, view, quiet_console):
+    fake = install_model(loop, [message([text_block("hi")])])
+    side = FakeSide()
+
+    cli._run_interactive(
+        loop, backend, store, view, Browser(backend, store),
+        ScriptedReader(["/btw what did you find?", "/exit"]), side=side,
+    )
+
+    assert side.asked == ["what did you find?"]
+    assert fake.calls == [] and loop.messages == []
+
+
+def test_a_provider_400_ends_the_turn_with_an_event_the_person_can_see(
+    ctx, store, view, quiet_console
+):
+    """The Bedrock refusal that moved routing out of the agent (`desk.py`) ended its
+    turn with an empty assistant row and nothing else in the record: the notice was
+    live-only, and a page loaded afterwards showed an agent that stopped talking."""
+    import anthropic
+    from types import SimpleNamespace
+
+    said = ("messages.1.content.0: Invalid `signature` in `thinking` block. The block is "
+            "bound to a different conversation. The `system` prompt and the `tools` list "
+            "both differ from when this block was created.")
+
+    class Refusing:
+        def stream(self, **kwargs):
+            raise anthropic.BadRequestError(
+                said, response=SimpleNamespace(status_code=400, headers={}, request=None),
+                body=None)
+
+    loop = Loop(Config(llm_api_key="k", model="claude-opus-5-5"), ctx, store, view)
+    loop.client = SimpleNamespace(messages=Refusing())
+    loop.say("go")
+
+    assert cli._run_turn(loop, view) is False
+
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert any(e.startswith("The model request failed, so this turn ended:")
+               and "Invalid `signature`" in e for e in events)
+    assert any("Invalid `signature`" in n for n in view.notices)
 
 
 # -- push (upload) -------------------------------------------------------------
@@ -1682,20 +1726,6 @@ def test_a_completed_turn_resets_the_failure_count(loop, view, monkeypatch):
     monkeypatch.setattr(loop, "run", lambda: None)
     assert cli._run_turn(loop, view) is True
     assert loop.api_failures == 0
-
-
-def test_a_failed_prompt_turn_reaches_the_desk(loop, backend, store, view, quiet_console, monkeypatch):
-    """When a turn typed at the prompt fails, the desk still answers -- the reason
-    someone types 'are you still working?' is that the agent went quiet."""
-    monkeypatch.setattr(loop, "run", lambda: (_ for _ in ()).throw(_api_error()))
-    desk = FakeDesk()
-
-    cli._run_interactive(
-        loop, backend, store, view, Browser(backend, store),
-        ScriptedReader(["are you still working?", "/exit"]), concierge=desk,
-    )
-
-    assert "are you still working?" in desk.asked
 
 
 def test_an_empty_key_is_not_reported_as_set():
@@ -2172,3 +2202,106 @@ def test_the_join_notice_says_nothing_about_others_when_there_is_only_one():
         assert "another session may be using it" in notice
         assert "workspaces" not in notice
         assert "--instance" not in notice
+
+
+# -- a transient failure is asked again ---------------------------------------
+
+
+def _failing_then(loop, errors):
+    """`loop.run` raising each of `errors` in turn, then completing."""
+    calls = []
+    errors = list(errors)
+
+    def run():
+        calls.append(1)
+        if errors:
+            raise errors.pop(0)
+
+    loop.run = run
+    return calls
+
+
+def test_a_rate_limited_turn_is_retried_rather_than_ended(loop, view, store, quiet_console):
+    """2026-10-19: five studies met foamd's limiter (`429 rate_limited ... retry in 1s`)
+    with no job running. Each turn ended, nothing was left to wake the agent, and every
+    one of them sat in "your turn" with nothing said until it was ended by hand."""
+    calls = _failing_then(loop, [_api_error(429), _api_error(503), _api_error(None)])
+
+    assert cli._run_turn(loop, view) is True
+    assert len(calls) == 4
+    assert loop.api_failures == 0 and loop.blocked_reason is None
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert not any(e.startswith("The model request failed") for e in events), \
+        "a turn that went through is not recorded as failed"
+
+
+def test_a_retried_turn_says_it_is_still_the_agents_move(loop, view, quiet_console, monkeypatch):
+    working = []
+    monkeypatch.setattr(view, "working", working.append, raising=False)
+    _failing_then(loop, [_api_error(429)])
+
+    assert cli._run_turn(loop, view) is True
+    assert working and "trying again" in working[0]
+
+
+def test_retries_end_once_the_waits_are_spent(loop, view, store, quiet_console):
+    from openreynolds.llm import base
+
+    calls = _failing_then(loop, [_api_error(429)] * 99)
+
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == len(base.TRANSIENT_WAITS) + 1
+    assert loop.api_failures == 1, "one failed turn, however many tries it took"
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert sum(e.startswith("The model request failed") for e in events) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 413])
+def test_a_refusal_is_not_retried(loop, view, quiet_console, status):
+    calls = _failing_then(loop, [_api_error(status)] * 99)
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == 1
+
+
+def test_leaving_during_a_retry_wait_stops_the_retries(loop, view, quiet_console):
+    calls = _failing_then(loop, [_api_error(429)] * 99)
+    loop.leaving = True
+
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == 1
+
+
+def test_words_typed_during_a_retry_wait_reach_the_thread(loop, view, quiet_console):
+    calls = _failing_then(loop, [_api_error(429)])
+    typed = ["are you still there?"]
+
+    def heard():
+        if typed:
+            loop._typed.append(typed.pop())
+        return bool(loop._typed)
+
+    loop.heard = heard
+    loop.say("go")
+
+    assert cli._run_turn(loop, view) is True
+    assert len(calls) == 2
+    assert loop.messages[-1] == {"role": "user", "content": "are you still there?"}
+
+
+def test_retry_after_lengthens_a_wait_but_never_shortens_it():
+    from types import SimpleNamespace
+    from openreynolds.llm import ProviderError, base
+
+    def raised(after):
+        cause = Exception()
+        cause.response = SimpleNamespace(headers={"retry-after": after})
+        exc = ProviderError("rate_limited", 429)
+        exc.__cause__ = cause
+        return exc
+
+    assert base.retry_delay(raised("1"), 0) == base.TRANSIENT_WAITS[0]
+    assert base.retry_delay(raised("90"), 0) == 90
+    assert base.retry_delay(raised("99999"), 0) == base.MAX_RETRY_AFTER
+    assert base.retry_delay(raised("Wed, 21 Oct 2026 07:28:00 GMT"), 1) == base.TRANSIENT_WAITS[1]
+    assert base.retry_delay(ProviderError("x", 429), len(base.TRANSIENT_WAITS)) is None
+    assert base.retry_delay(ProviderError("x", 402), 0) is None

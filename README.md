@@ -133,6 +133,11 @@ in stages you approve (see *Modes*). The harness then gates exactly what you ask
 have gated and nothing else, for the same reason `/btw` exists: it is your say in how
 you want to be heard, not the harness's opinion about how the model should work.
 
+The rule that keeps the agent's view of the session stable: **its system prompt and its
+tool list never change mid-conversation.** A study whose solver is left to choose has it
+chosen from your first message, by a request of its own, before the agent's first turn
+(`desk.route`), and the agent starts on that solver's prompt and tools.
+
 That is not a convention anyone has to remember. `tests/test_prompt.py` fails the build
 if imperative language appears in the system prompt, and `tests/test_briefing.py`
 applies the same rule to the briefing, because a harness that starts telling the model
@@ -173,7 +178,7 @@ stopping it. These are answered by the harness instead:
 
 | Command | What it does |
 | --- | --- |
-| `/btw <something>` | Say it without asking the agent to stop. |
+| `/btw <question>` | A side question: answered now from the agent's context, apart from the conversation, without interrupting it. |
 | `/status` | What is happening right now, with no model turn. |
 | `/files [path]`, `/renders`, `/open` | Look at the workspace, the pictures, or the local folder. |
 | `/mode [name]` | Show or switch the mode. |
@@ -361,6 +366,7 @@ down to **0.567**.
 | `openreynolds` | Start a study. `--study <id>` resumes one, `--instance <id>` attaches to a particular workspace. |
 | `-p "..."` | Run non-interactively and exit. Exit code `0` done, `1` the model API failed or the session crashed, `2` hit `--max-wait` with work still running. With a mode other than `auto` it is refused as a usage error, also exit `2`. |
 | `--mode auto\|partial\|structured` | How much the agent does before asking you. See *Modes*. |
+| `--solver auto\|openfoam\|felix` | Which solver the study runs: OpenFOAM on the workspace's CPU cores, or Felix, an incompressible GPU solver whose solves run on cloud GPUs (hosted workspace only). `auto`, the default, chooses it from your first message, by a request of its own before the agent's first turn, and the workspace -- of that solver's kind -- starts only then; the reason is shown to you and told to the agent, and a request that cannot choose leaves the study on OpenFOAM, said so. Fixed for the whole study; a resumed study keeps its solver and ignores a different flag. `OPENREYNOLDS_SOLVER` sets it when the flag is not given. |
 | `--model <id>` / `--effort low\|medium\|high` | The model and reasoning effort for this session; the model is recorded on the study, so a resume carries on on it unless one is named again. `/model` and `/effort` change either mid-study. |
 | `--output-format stream-json` | One JSON object per line on stdout and nothing else. See *Driving it from a program*. In front of `studies` or `doctor` it means their `--json`; in front of any other subcommand it is refused rather than ignored. |
 | `openreynolds login` | Sign in; this machine gets its own service key. `--browser` approves a short code in a browser, which is the device-code flow and the only way in for a Google account. |
@@ -374,10 +380,11 @@ down to **0.567**.
 | `openreynolds video` | Assemble mirrored frames into a video, here. |
 | `openreynolds stop` | Stop this study's jobs and confirm they stopped. `--force` skips the prompt. |
 
-In a session, `/status` answers locally with no model turn, `/btw` says something
-without interrupting the work, `/mode`, `/model` and `/effort` change how the session
-runs, and anything else you type reaches the model at its next step, so you can steer a
-run without stopping it. `/help` has the rest; see *In a session: commands, help and
+In a session, `/status` answers locally with no model turn, `/btw <question>` asks a
+side question that is answered apart from the conversation without interrupting the
+work, `/mode`, `/model` and `/effort` change how the session runs, and anything else you
+type reaches the model at its next step -- a receipt says so at once, and an agent
+holding a wait reads it within a second -- so you can steer a run without stopping it. `/help` has the rest; see *In a session: commands, help and
 completion*.
 
 ## Driving it from a program
@@ -422,12 +429,16 @@ three cases exit code `1` alone cannot tell apart. In between:
 | `step` | One round of think-then-act finished: which round, how long, how many calls. |
 | `jobs` | Every job and its state, whenever any of it changes. |
 | `progress` | What is running and how far along, when the picture changes. |
-| `stage` / `narration` / `desk` / `status` | What is happening now, in words. |
+| `stage` / `narration` / `status` | What is happening now, in words. `narration` is made from the job and tool in flight, with no model call. |
+| `working` | The session is busy on the agent's behalf before any model output exists -- `text` says what, e.g. `choosing the solver` while an open solver is routed. It is the agent's move, not yours. |
+| `receipt` | A message typed while the agent is mid-turn was queued: `text` says it reaches the agent at its next step and what the agent is doing until then. |
+| `side_question` / `side_answer` | A `/btw` side question (`text`), and its answer (`text`, and `forwarded`: whether the person's words were also passed on to the agent). Never part of the conversation. |
 | `desk_step` | One step of the CAD desk's work while the `cad` tool runs, or the independent reviewer's verdict on it (`kind` is `cell` or `review`): `step`, `text` (the desk's own sentence, or the verdict), `cmd`, `exit_code`, `seconds`, `image`. The same object is an `event` row in the study's transcript. |
 | `mirrored` / `delivered` / `files` / `renders` | Files coming home, and what is in the workspace. |
 | `notice` / `warn` / `info` / `usage` / `watching` / `interjection` / `prompt` | The rest of the terminal's own reporting. |
 | `model` | The session's `model`, `effort` and `provider`: once at the start, and again whenever `/model` or `/effort` changes one. |
 | `mode` | The session's `mode` (`auto`, `partial` or `structured`) and its `label`: once at the start, and again at every `/mode` switch. |
+| `solver` | The study's `solver`, `openfoam` or `felix`: at the start when it is known, else the moment it is chosen from the first message, before the agent's first turn. Once; it does not change. |
 | `approval` | A question for the person, in ask-before-compute or structured mode: `id`, `kind` (`job` or `checkpoint`), `title`, `detail` and `choices`. The session waits for the answer. |
 | `approval_done` | The question `id` was answered: `outcome` is `approved`, `declined` or `approved_all`, and `note` carries what the person said. |
 | `error` | An exception escaped the session. `session_end` follows with `crashed`. |
@@ -454,6 +465,7 @@ containers want:
 | `OPENREYNOLDS_PROVIDER` | A preset name, or `reynolds` for the metered model. It does not hold a resume to that provider: a study restores the provider it recorded, so name a model too if you mean to move one. |
 | `OPENREYNOLDS_LLM_API_KEY` | The model key. The vendor's own name (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) is read too. |
 | `OPENREYNOLDS_MODEL` / `OPENREYNOLDS_EFFORT` | Which model, and how hard it is asked to think (`low`, `medium` or `high`). A resumed study keeps the model it was last running unless `OPENREYNOLDS_MODEL` names one. |
+| `OPENREYNOLDS_SOLVER` | `auto`, `openfoam` or `felix`, read when `--solver` is not given. A resumed study keeps the solver it has. |
 | `OPENREYNOLDS_MODE` | `auto`, `partial` or `structured`, or an alias. A value that is not a mode is ignored with a warning: the config file's `mode` applies, or full auto, and a resumed study keeps its stored mode. |
 | `FOAMD_URL` / `FOAMD_API_KEY` | The workspace service and this machine's key. |
 | `OPENREYNOLDS_MIRROR_INTERVAL_S` | How often files come home. `0` turns it off. |

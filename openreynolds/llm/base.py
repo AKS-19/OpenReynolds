@@ -16,6 +16,7 @@ turn from the neutral blocks and simply loses the parts only the original could 
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -29,6 +30,68 @@ class ProviderError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+TRANSIENT_STATUSES = frozenset({408, 409, 425, 429})
+"""The 4xx answers worth asking again: a timeout, a conflict, a rate limit. Every other
+4xx is about this account or this request -- the budget, the key, the model id -- and
+answers the same way in a minute. A 5xx, and a call the API never answered at all, are
+worth asking again too (`transient`)."""
+
+TRANSIENT_WAITS = (5.0, 15.0, 30.0, 60.0, 120.0)
+"""Seconds before each retry of a request that failed transiently: about four minutes
+in all, then the failure is the caller's to report.
+
+The SDK's own retries come first and give up within seconds, which is too soon for the
+limiter that ended five studies on 2026-10-19: foamd's per-key bucket
+(`too many requests; retry in 1s`), drained by two or three sessions on one account
+calling it at once. Its refill is steady, so a wait measured in tens of seconds finds
+it full where a second's does not. A turn that ended on it instead never resumed: with
+no job running there was nothing left to wake the agent, and the study sat in "your
+turn" with nothing said."""
+
+MAX_RETRY_AFTER = 300.0
+"""The most a `Retry-After` header may stretch one wait to."""
+
+
+def transient(exc: ProviderError) -> bool:
+    """Whether asking again could get a different answer."""
+    status = exc.status_code
+    return status is None or status >= 500 or status in TRANSIENT_STATUSES
+
+
+def retry_after(exc: BaseException) -> float | None:
+    """The `Retry-After` seconds of the SDK error a `ProviderError` was raised from,
+    when it had one. Every provider raises from the SDK's own error (`raise ... from
+    exc`), and the SDK's status errors keep the response."""
+    response = getattr(exc.__cause__, "response", None)
+    headers = getattr(response, "headers", None)
+    raw = headers.get("retry-after") if headers is not None else None
+    try:
+        return max(0.0, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        return None  # the HTTP-date form: the scheduled wait stands
+
+
+def retry_delay(exc: ProviderError, attempt: int,
+                waits: tuple[float, ...] = TRANSIENT_WAITS) -> float | None:
+    """How long to wait before asking again after `exc`, on retry number `attempt`
+    (0-based), or None when it should not be asked again: a refusal, or the waits
+    are spent. A server's `Retry-After` lengthens a wait, never shortens it."""
+    if not transient(exc) or attempt >= len(waits):
+        return None
+    return max(waits[attempt], min(retry_after(exc) or 0.0, MAX_RETRY_AFTER))
+
+
+def nap(seconds: float, stop: Callable[[], bool] = lambda: False) -> bool:
+    """Sleep `seconds`, a second at a time, unless `stop()` comes true first.
+    Returns whether the whole wait was slept."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        if stop():
+            return False
+        time.sleep(min(1.0, left))
+    return not stop()
 
 
 class BadRequest(ProviderError):
@@ -78,6 +141,20 @@ class Turn:
     content: list[Any]
     stop_reason: str = "end_turn"
     stop_explanation: str = ""
+    stop_category: str = ""
+    """On a `refusal`, the policy area the provider's classifier named (Anthropic's
+    `stop_details.category`: `cyber`, `bio`, `frontier_llm`, `reasoning_extraction`,
+    `general_harms`), or empty when it named none. Shown, never parsed: the vendor says
+    the wording is not stable."""
+    model: str = ""
+    """The model that served this turn, by the id it was asked for. Usually the
+    session's; after a refusal it is the fallback that answered
+    (`Provider.with_fallback`)."""
+    declined: list[tuple[str, str]] = field(default_factory=list)
+    """`(model, why)` for every model that refused this request before `model` was
+    asked. Empty on an ordinary turn. When `stop_reason` is itself `refusal`, these are
+    the models that declined before the one whose refusal this is -- the whole chain
+    said no."""
     context_tokens: int = 0
     """Everything this request occupied in the model's window -- input, cached input
     and output together -- so the loop can tell when a refresh is due. Each provider
@@ -143,6 +220,66 @@ class Provider:
 
     name = ""
 
+    fallbacks: tuple[str, ...] = ()
+    """The models a refused request is retried on, in order (`make_provider` sets it
+    from the configuration or the preset). Empty means a refusal is final.
+
+    A refusal here is the vendor's own safety classifier declining a request --
+    Anthropic answers it as a normal 200 with `stop_reason: "refusal"`, and its
+    documentation says the remedy is to send the same request to another Claude model.
+    One did, live, on 2026-10-01: a CFD study was declined under the "reverse
+    engineering or duplicating model outputs" rule, and the session stopped dead with
+    the sentence on screen and nothing else to do. The classifier is per model, so the
+    same request on the next model usually goes through."""
+
+    @property
+    def pinned(self) -> dict[str, str]:
+        """`requested model -> the fallback that answered`, for the rest of this
+        provider's life. The vendor's advice is to stay on the model that accepted
+        rather than re-ask the one that refused on every turn, and a refusal that
+        arrives before any output is still billed in some categories. A desk running
+        its own thirty-step loop on the model that just declined would otherwise pay
+        for thirty refusals. `switch.apply` clears it: a switch the person asked for
+        outranks a pin a refusal made."""
+        pins = self.__dict__.get("_pinned")
+        if pins is None:
+            pins = self.__dict__["_pinned"] = {}
+        return pins
+
+    def chain(self, model: str) -> list[str]:
+        """The models to ask, in order: the one named (or the fallback pinned for it),
+        then every fallback not yet in the list."""
+        asked = self.pinned.get(model, model)
+        out = [asked]
+        for alt in self.fallbacks:
+            if alt not in out and alt != model:
+                out.append(alt)
+        return out
+
+    def with_fallback(self, model: str, send: Callable[[str], "Turn"]) -> "Turn":
+        """`send(model)`; on a refusal, `send` again down `fallbacks`, pinning the
+        model that answers. The turn that comes back names the model that served it and
+        every model that declined before it. When the whole chain declines, the last
+        refusal is returned with the earlier ones listed on it."""
+        declined: list[tuple[str, str]] = []
+        turn: Turn | None = None
+        for asked in self.chain(model):
+            turn = send(asked)
+            # The id as it was asked for, not the dated one the vendor resolves it to:
+            # this is what the next request (and a hosted allowlist) will be given.
+            turn.model = asked
+            if turn.stop_reason != "refusal":
+                if asked != model:
+                    self.pinned[model] = asked
+                break
+            declined.append((asked, _why(turn)))
+        assert turn is not None
+        if turn.stop_reason == "refusal":
+            # The last refusal is the turn; the models before it are the record.
+            declined = declined[:-1]
+        turn.declined = declined
+        return turn
+
     def stream(
         self,
         *,
@@ -168,6 +305,27 @@ class Provider:
         `ProviderError` -- with `CANNOT_SEE` in the message when it is the image that
         was refused."""
         raise NotImplementedError
+
+
+def _why(turn: "Turn") -> str:
+    """A refusal's reason as one line: the category, then the vendor's sentence."""
+    parts = [p for p in (turn.stop_category, turn.stop_explanation) if p]
+    return ": ".join(parts) if parts else "no explanation given"
+
+
+def refusal_line(turn: "Turn") -> str:
+    """What to tell a person about a turn that is a refusal, or that was served only
+    after one. Empty for an ordinary turn."""
+    if turn.stop_reason == "refusal":
+        chain = [*turn.declined, (turn.model or "the model", _why(turn))]
+        said = "; ".join(f"{model} ({why})" for model, why in chain)
+        if len(chain) == 1:
+            return f"The model declined this request: {_why(turn)}"
+        return f"Every model declined this request -- {said}"
+    if turn.declined:
+        said = "; ".join(f"{model} ({why})" for model, why in turn.declined)
+        return f"{said} declined this request; {turn.model} answered it instead."
+    return ""
 
 
 CANNOT_SEE = "cannot see images"

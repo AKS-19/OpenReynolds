@@ -132,12 +132,12 @@ def test_reynolds_needs_only_the_service_key(loop, models):
 
 def test_the_model_asked_for_survives_the_presets_default(loop, models):
     """`candidate` rebuilds the configuration with `replace`, which re-runs
-    `__post_init__` and its preset swap. On `reynolds` that turned the Opus a person
-    typed -- one of the two models that service meters -- straight back into Sonnet,
-    on `/model` and on every resume that went through here."""
+    `__post_init__` and its preset swap. On `reynolds` that turned the second model a
+    person typed (then Opus) straight back into the default, on `/model` and on every
+    resume that went through here."""
     cfg = Config(provider="reynolds", foamd_api_key="svc")
-    assert cfg.model == "claude-sonnet-5"  # nobody named one, so the preset's
-    assert switch.candidate(cfg, "reynolds", "claude-opus-5", "").model == "claude-opus-5"
+    assert cfg.model == "gpt-6.1-sol"  # nobody named one, so the preset's
+    assert switch.candidate(cfg, "reynolds", "gpt-6-astra", "").model == "gpt-6-astra"
 
 
 def test_a_same_provider_switch_leaves_the_desk_model_alone(loop, models):
@@ -213,6 +213,101 @@ def test_a_provider_switch_rebuilds_the_client_and_recomputes_the_window(loop, m
     assert loop.window == 400_000
     assert loop._no_system_role is False
     assert loop.cfg.desk_model == "gpt-5-mini"
+
+
+@pytest.fixture
+def reynolds_loop(store, seen):
+    cfg = Config(provider="reynolds", foamd_url="https://api.example", foamd_api_key="svc")
+    assert (cfg.model, cfg.desk_model, cfg.context_window) == ("gpt-6.1-sol", "gpt-6-luna", 272_000)
+    made = Loop(cfg, ToolContext(backend=None, store=store, max_output=1000), store, seen)
+    made.provider = FakeProvider()
+    return made
+
+
+def test_a_reynolds_switch_to_claude_rebuilds_the_client_for_the_messages_api(
+        reynolds_loop, models, store):
+    """Same provider, same key, same service -- but GPT and Claude are two APIs at two
+    routes of it, so the client is rebuilt, the desk takes Claude's desk model and the
+    window is Claude's."""
+    loop = reynolds_loop
+    switch.request(loop, "claude-opus-5-5", env={})
+    pending = loop.pending_model
+    assert (pending.provider, pending.model, pending.desk_model) == (
+        "reynolds", "claude-opus-5-5", "claude-haiku-4-5")
+    assert pending.context_window == 1_000_000
+    before = loop.provider
+    loop.say("carry on")
+    loop.run()
+    assert loop.provider is models.last and loop.provider is not before
+    assert models.built[-1] == ("reynolds", "claude-opus-5-5", "")
+    assert models.last.calls[-1]["model"] == "claude-opus-5-5"
+    assert (loop.cfg.desk_model, loop.window) == ("claude-haiku-4-5", 1_000_000)
+    assert (store.session.provider, store.session.model) == ("reynolds", "claude-opus-5-5")
+
+    # Within the family it is the same client, as on any provider.
+    switch.request(loop, "claude-sonnet-5-5", env={})
+    claude = loop.provider
+    loop.say("next")
+    loop.run()
+    assert loop.provider is claude and loop.cfg.desk_model == "claude-haiku-4-5"
+
+    # And back to GPT: rebuilt again, GPT's desk and GPT's priced window.
+    switch.request(loop, "gpt-6-astra", env={})
+    loop.say("next")
+    loop.run()
+    assert loop.provider is not claude
+    assert (loop.cfg.model, loop.cfg.desk_model, loop.window) == (
+        "gpt-6-astra", "gpt-6-luna", 272_000)
+
+
+def test_a_reynolds_thread_crosses_families_through_neutral_blocks():
+    """A GPT turn carries its own output items -- the encrypted reasoning among them --
+    which mean nothing to Claude; the Messages API is sent its words and tool calls."""
+    from openreynolds.llm import ToolUseBlock, make_provider
+    from openreynolds.llm.anthropic_api import AnthropicProvider
+
+    cfg = Config(provider="reynolds", foamd_url="https://api.example", foamd_api_key="svc",
+                 model="claude-opus-5-5")
+    provider = make_provider(cfg)
+    assert isinstance(provider, AnthropicProvider)
+    messages = [
+        {"role": "user", "content": "mesh it"},
+        {"role": "assistant", "provider": "openai-responses",
+         "content": [TextBlock("meshing"), ToolUseBlock("call_1", "bash", {"cmd": "ls"})],
+         "raw": [{"type": "reasoning", "encrypted_content": "gAAAA"},
+                 {"type": "function_call", "call_id": "call_1", "name": "bash",
+                  "arguments": "{}"}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1",
+                                      "content": "done"}]},
+    ]
+    rendered = provider.render(messages)
+    assert rendered[1]["content"] == [
+        {"type": "text", "text": "meshing"},
+        {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"cmd": "ls"}},
+    ]
+    assert "gAAAA" not in repr(rendered)
+
+
+def test_the_cad_desk_and_reviewer_follow_a_reynolds_switch_across_families(store):
+    from openreynolds import cad
+    from openreynolds.llm.anthropic_api import AnthropicProvider
+    from openreynolds.llm.responses_api import ResponsesProvider
+
+    cfg = Config(provider="reynolds", foamd_url="https://api.example", foamd_api_key="svc")
+    backend = SimpleNamespace(workspace_root="/work")
+    desk = cad.CoreDesk(cfg, backend, store, "/work")
+    reviewer = cad.Reviewer(cfg, backend)
+    assert isinstance(desk.provider, ResponsesProvider) and desk.model == "gpt-6.1-sol"
+    kept = desk.provider
+    desk._follow()
+    assert desk.provider is kept  # nothing moved, nothing rebuilt
+    cfg.model = "claude-opus-5-5"
+    desk._follow()
+    reviewer._follow()
+    for built in (desk, reviewer):
+        assert built.model == "claude-opus-5-5"
+        assert isinstance(built.provider, AnthropicProvider)
+        assert built.provider.fallbacks == ("claude-sonnet-5-5", "claude-opus-5-5")
 
 
 def test_earlier_thinking_is_stripped_when_the_model_changes(loop, models):
@@ -291,6 +386,25 @@ def test_a_model_change_on_the_same_client_clears_what_it_latched(loop, models):
     assert client.lean is False and client.legacy_max_tokens is False
 
 
+def test_a_model_change_clears_the_pin_a_refusal_made(loop, models):
+    """`Provider.with_fallback` pins a refused model to the one that answered for it.
+    The person naming a model is asking for that model, not for where its refusals
+    went -- so `/model claude-opus-5` after a fallback to Sonnet really asks Opus."""
+    client = loop.provider
+    client.pinned = {"claude-opus-5": "claude-sonnet-5"}
+    switch.request(loop, "claude-sonnet-5", env={})
+    loop.say("go")
+    loop.run()
+    assert client.pinned == {}
+
+
+def test_the_status_names_the_fallback_chain(loop):
+    loop.provider.fallbacks = ("claude-opus-5", "claude-sonnet-5")
+    text = "\n".join(switch.request(loop, ""))
+    assert "declines a request, it is retried on: claude-sonnet-5" in text
+    assert "retried on: claude-opus-5" not in text  # not on itself
+
+
 def test_a_same_provider_switch_takes_the_new_models_own_window(loop, models):
     loop.context_tokens = 600_000  # fits 1M, not Haiku's 200k
     said = "\n".join(switch.request(loop, "claude-haiku-4-5", env={}))
@@ -309,7 +423,10 @@ def test_leaving_a_model_with_its_own_window_goes_back_to_the_providers(loop, mo
 def test_reynolds_offers_only_the_models_the_service_meters():
     from openreynolds.llm.presets import models_for
 
-    assert models_for("reynolds") == ("claude-sonnet-5", "claude-opus-5")
+    assert models_for("reynolds") == ("gpt-6.1-sol", "gpt-6-astra",
+                                      "claude-sonnet-5-5", "claude-opus-5-5")
+    assert "gpt-6-luna" not in models_for("reynolds")
+    assert "claude-haiku-4-5" not in models_for("reynolds")
     assert "claude-haiku-4-5" in models_for("anthropic")
     assert models_for("openai") == ("gpt-5", "gpt-5-mini")
 
@@ -518,6 +635,51 @@ def test_a_refused_restore_leaves_the_study_the_pair_it_recorded(
     assert (session.provider, session.model) == ("openai", "gpt-5")
 
 
+def test_a_reynolds_study_recorded_on_claude_5_carries_on_on_its_successor(
+    nobody_named_a_model, monkeypatch, tmp_path, capsys
+):
+    """The service metered Claude 5 until 2026-10 and meters the 5.5 models now, so a
+    study recorded then names an id the service no longer has. Restored, it is a 4xx
+    on the first turn; it stays on Reynolds' model, on Claude's successor -- the person
+    chose Claude -- with Claude's desk and window, and says so."""
+    studies = _stored_study(tmp_path, "claude-opus-5", "reynolds")
+    cfg = _resume(monkeypatch, studies)  # configured for anthropic
+    assert (cfg.provider, cfg.model) == ("reynolds", "claude-opus-5-5")
+    assert cfg.desk_model == "claude-haiku-4-5"
+    assert cfg.context_window == 1_000_000
+    said = said_on_the_console(capsys)
+    assert "claude-opus-5" in said and "no longer serves" in said
+
+
+def test_a_reynolds_study_on_an_unknown_id_carries_on_on_the_default(
+    nobody_named_a_model, monkeypatch, tmp_path
+):
+    studies = _stored_study(tmp_path, "gpt-5.6-sol", "reynolds")
+    cfg = _resume(monkeypatch, studies)
+    assert (cfg.provider, cfg.model, cfg.desk_model) == ("reynolds", "gpt-6.1-sol", "gpt-6-luna")
+    assert cfg.context_window == 272_000
+
+
+def test_a_retired_reynolds_record_is_rewritten_with_what_ran(
+    nobody_named_a_model, monkeypatch, tmp_path
+):
+    """Unlike a refused restore, nothing anywhere can honour this record, so keeping it
+    would only repeat the notice on every resume."""
+    from conftest import FakeBackend, reserved
+    from test_jsonview import FakeLoop
+
+    monkeypatch.setattr(cli.hosted, "reserve", reserved(FakeBackend()))
+    monkeypatch.setattr(cli, "Loop", FakeLoop)
+    studies = _stored_study(tmp_path, "claude-sonnet-5", "reynolds")
+    cfg = Config(foamd_url="u", foamd_api_key="k", provider="reynolds", studies_dir=studies,
+                 capture=False, desk=False, mesh_tool=False, mirror_interval_s=0.0)
+
+    cli.session(cfg, study_id="study-x", instance_id=None, one_shot="go", plain=True)
+
+    session = Store(studies, "study-x").session
+    assert (session.provider, session.model) == ("reynolds", "claude-sonnet-5-5")
+
+
 # -- effort ----------------------------------------------------------------------
 
 
@@ -550,23 +712,28 @@ def test_model_and_effort_are_answered_locally(loop, store, seen, models):
     assert "outside a session" in seen.statuses[-1][0]
 
 
-def test_the_desk_follows_a_provider_change(store, view, monkeypatch):
-    from openreynolds import desk as desk_mod
+def test_the_side_chat_asks_the_provider_the_loop_has_now(ctx, store, view):
+    """The front desk kept a client of its own and had to follow a switch to it. The
+    side chat has none: it asks the loop's provider, on the request it forks, so a
+    switch the loop has applied is the one it uses, and one still pending is not."""
+    from openreynolds.desk import SideChat
+    from openreynolds.loop import Loop
 
-    cfg = Config(llm_api_key="k", desk_model="claude-haiku-4-5")
-    desk = desk_mod.Concierge(cfg, store, view)
-    built = []
+    loop = Loop(Config(llm_api_key="k", model="claude-opus-5-5"), ctx, store, view)
+    loop.say("go")
+    asked = []
 
-    def make(c, **kw):
-        built.append(c.provider)
-        return SimpleNamespace(complete=lambda **k: f"answer from {k['model']}", client=None)
+    class Provider:
+        def stream(self, **kwargs):
+            asked.append(kwargs["model"])
+            from openreynolds.llm import Turn
+            from openreynolds.llm.base import TextBlock
 
-    monkeypatch.setattr(desk_mod, "make_provider", make)
-    desk._call("s", "p", 10)
-    assert built == []  # nothing moved, nothing rebuilt
-    cfg.provider, cfg.llm_api_key, cfg.desk_model = "openai", "sk-o", "gpt-5-mini"
-    assert desk._call("s", "p", 10) == "answer from gpt-5-mini"
-    assert built == ["openai"]
+            return Turn(content=[TextBlock(text="ok")])
+
+    loop.provider = Provider()
+    SideChat(loop, view, deliver=lambda w, n: None).ask("which model?", wait=True)
+    assert asked == ["claude-opus-5-5"]
 
 
 def test_the_mesher_reads_the_model_at_each_run(store, monkeypatch):
@@ -579,7 +746,7 @@ def test_the_mesher_reads_the_model_at_each_run(store, monkeypatch):
     desk._follow()
     assert desk.model == "claude-sonnet-5" and desk.provider is kept
 
-    monkeypatch.setattr(agent, "make_provider", lambda c: "rebuilt")
+    monkeypatch.setattr(agent, "make_provider", lambda c, **kw: "rebuilt")
     cfg.provider, cfg.llm_api_key, cfg.model = "openai", "sk-o", "gpt-5"
     desk._follow()
     assert desk.provider == "rebuilt" and desk.model == "gpt-5"

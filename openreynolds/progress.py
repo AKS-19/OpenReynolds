@@ -237,14 +237,83 @@ PHASE_OF = {
 _TOKEN = re.compile(r"[A-Za-z0-9_./-]+")
 
 
+_FELIX_SOLVE = re.compile(r"(?:^|[;&|(]\s*|\s)felix\s+(?:run|continue)\b")
+
+
+def is_felix_solve(cmd: str) -> bool:
+    """Whether a job's command is a Felix solve: `felix run` or `felix continue`."""
+    return bool(_FELIX_SOLVE.search(cmd or ""))
+
+
+def felix_job_progress(record: Any, tail: str, log_size: int) -> JobProgress | None:
+    """What the bar shows for a Felix solve, read from the tail of its log.
+
+    Felix's log has no `Time =` and its case has no controlDict, so the OpenFOAM
+    reading would show a solve as merely "running". `felix_progress` reads the
+    `step=` records (step, time, dt, residuals), the `ERROR:` / `WARNING:` lines and
+    the final status `felix run` prints; the tracker adds the case's `nsteps`."""
+    from . import felix_progress
+
+    felix = felix_progress.parse_felix_log(tail)
+    return JobProgress(
+        job_id=record.job_id,
+        name=record.name or record.job_id[:8],
+        phase="solving",
+        executable="felix",
+        facts=felix_progress.log_facts(felix),
+        log_size=log_size,
+        elapsed_s=_seconds_since(getattr(record, "launched_at", "")),
+        as_of=time.monotonic(),
+        step=felix.step,
+        felix=felix,
+    )
+
+
+FELIX_LOG_TAIL_BYTES = 256_000
+"""How much of a Felix job's log is read for its summary: the end, which is where the
+last `step=` records, the errors and the final status are."""
+
+
+def felix_job_summary(backend: Any, cmd: str, cwd: str, job_id: str,
+                      log_size: int | None) -> list[str] | None:
+    """A Felix solve's job in a few lines (`felix_progress.summary_lines`), for
+    `job_check` and the job-end wake; None for any other command.
+
+    The log is the job's own; `nsteps` is the case's control.yaml, found from the
+    `felix run|continue <case>` in the command."""
+    from . import felix_progress
+
+    if not felix_progress.is_felix_cmd(cmd):
+        return None
+    size = log_size or 0
+    try:
+        text, _next, _eof = backend.job_tail(job_id, offset=max(0, size - FELIX_LOG_TAIL_BYTES))
+    except BackendError:
+        return None
+    nsteps = None
+    case_dir = felix_progress.case_dir_from_felix_cmd(cmd, cwd)
+    if case_dir:
+        try:
+            control = backend.get_file(f"{case_dir}/control.yaml", limit=32_000)
+        except (BackendError, OSError, KeyError):
+            control = b""
+        nsteps = felix_progress.nsteps_from_control(control.decode("utf-8", "replace"))
+    return felix_progress.summary_lines(felix_progress.parse_felix_log(text), nsteps)
+
+
 def phase_from_cmd(cmd: str) -> tuple[str, str]:
     """(phase, executable) for a shell command, from the last thing in it that this
     recognises. A chain like `blockMesh && simpleFoam` reads as solving: it is what
     the command is for, and the log says which part is actually running."""
     phase, exe = "running", ""
-    for token in _TOKEN.findall(cmd or ""):
+    tokens = _TOKEN.findall(cmd or "")
+    for i, token in enumerate(tokens):
         name = token.rsplit("/", 1)[-1]
-        if name in MESHERS:
+        if name == "felix" and i + 1 < len(tokens) and tokens[i + 1] in ("run", "continue"):
+            # A Felix solve (`felix run|continue <case>`) runs on a cloud GPU; this
+            # job is its client, and its log is the solve's.
+            phase, exe = "solving", "felix"
+        elif name in MESHERS:
             phase, exe = "meshing", name
         elif name in PHASE_OF:
             phase, exe = PHASE_OF[name], name
@@ -310,11 +379,24 @@ class JobProgress:
     log_size: int = 0
     as_of: float = 0.0
     """Monotonic clock at the last successful read."""
+    step: int | None = None
+    """A Felix job's last completed step; Felix counts steps, not an end time."""
+    end_step: int | None = None
+    """control.yaml `nsteps` of a Felix job (a PTC run may stop before it)."""
+    felix: Any = None
+    """The `felix_progress.FelixFacts` of a Felix job, for the wake line."""
 
     def headline(self, now: float | None = None) -> str:
         parts = [f"{self.phase} {self.name}".strip()]
         facts = self.facts
-        if self.phase == "solving" and facts.sim_time is not None:
+        if self.step is not None:
+            when = f"step {self.step}"
+            if self.end_step:
+                when += f" / {self.end_step}"
+            if facts.sim_time is not None:
+                when += f" · t {facts.sim_time:g}"
+            parts.append(when)
+        elif self.phase == "solving" and facts.sim_time is not None:
             when = f"Time {facts.sim_time:g}"
             if self.end_time is not None:
                 when += f" / {self.end_time:g} s"
@@ -411,9 +493,9 @@ class Tracker:
         self.store = store
         self.home = home
         self.local_dir = local_dir
-        self.concierge = None
-        """The front desk, told when the agent starts and stops working so it knows
-        whether the user is waiting on a busy agent. Set by the session; may be None."""
+        self._narrated = ""
+        """The last 'what's happening now' line said (`now_line`), so it is said again
+        only when it changes."""
         self._lock = threading.RLock()
         self._activity: Activity | None = None
         self._syncing_since: float | None = None
@@ -442,18 +524,12 @@ class Tracker:
         with self._lock:
             self._activity = activity
             self._tool_polled = 0.0
-        if self.concierge is not None:
-            self.concierge.working(kind != "waiting")
         self.push()
 
     def idle(self) -> None:
         """The session thread finished whatever it was doing."""
         with self._lock:
             self._activity = None
-            jobs = bool(self._jobs)
-        if self.concierge is not None:
-            # A running job still keeps the desk narrating; a bare idle does not.
-            self.concierge.working(jobs)
         self.push()
 
     # -- what the workspace says -----------------------------------------------
@@ -533,6 +609,11 @@ class Tracker:
                 )
             except BackendError:
                 tail = ""
+        if is_felix_solve(record.cmd):
+            felix = felix_job_progress(record, tail, size)
+            if felix is not None:
+                self._felix_bounds(record, felix)
+                return felix
         facts = parse_log_tail(tail)
         phase, exe = phase_from_cmd(record.cmd)
         if facts.is_solver:
@@ -557,6 +638,44 @@ class Tracker:
             progress.stop_at = control.get("stopAt")
             self._estimate(progress)
         return progress
+
+    def _felix_bounds(self, record: Any, progress: JobProgress) -> None:
+        """A Felix job's step against control.yaml `nsteps`, and the time left at
+        the solver's own wall time per step -- labelled an estimate, like the
+        OpenFOAM one. Felix's case has no controlDict; its bound is a step count."""
+        from . import felix_progress
+
+        felix = progress.felix
+        case_dir = felix_progress.case_dir_from_felix_cmd(
+            record.cmd, getattr(record, "cwd", "") or self.home)
+        if case_dir:
+            progress.end_step = self._felix_nsteps(case_dir)
+        if progress.end_step and felix is not None and felix.step is not None:
+            progress.fraction = max(0.0, min(1.0, felix.step / progress.end_step))
+            if felix.wall_time and 0 < felix.step < progress.end_step \
+                    and felix.outcome == "running":
+                progress.eta_s = (progress.end_step - felix.step) * felix.wall_time / felix.step
+
+    def _felix_nsteps(self, case_dir: str) -> int | None:
+        """`nsteps` from the case's control.yaml, from the mirror when it is here,
+        else from the instance; remembered like a controlDict."""
+        from . import felix_progress
+
+        now = time.monotonic()
+        key = f"felix:{case_dir}"
+        cached = self._control.get(key)
+        if cached and now - cached[0] < CONTROL_DICT_TTL_S:
+            return cached[1].get("nsteps")
+        path = f"{case_dir}/control.yaml"
+        text = self._read_local(path)
+        if text is None and self.backend is not None:
+            try:
+                text = self.backend.get_file(path, limit=32_000).decode("utf-8", "replace")
+            except (BackendError, OSError):
+                text = None
+        nsteps = felix_progress.nsteps_from_control(text) if text else None
+        self._control[key] = (now, {"nsteps": nsteps})
+        return nsteps
 
     def _estimate(self, progress: JobProgress) -> None:
         """Fraction and time left, from what the log and the controlDict say.
@@ -698,6 +817,54 @@ class Tracker:
             self.view.progress(self.snapshot())
         except Exception:  # noqa: BLE001 - presentation may not end a session
             pass
+        self._narrate()
+
+    def now_line(self) -> str:
+        """What the agent is doing right now, in a few words and with no clock in it:
+        the job that leads the bar, else what the session thread is in, else nothing.
+
+        The 'what's happening now' line. A model used to write it -- the front desk,
+        every couple of minutes, from a slice of the transcript -- and it read well and
+        cost a request each time, and said nothing the bar did not already know. This
+        is the bar's own knowledge in words. It has no elapsed time in it so that it
+        changes when the work does rather than every second; the bar carries the clock."""
+        with self._lock:
+            activity = self._activity
+            jobs = list(self._jobs.values())
+            starting = self._workspace_since is not None
+        lead = next((j for j in jobs if j.fraction is not None), jobs[0] if jobs else None)
+        if lead is not None:
+            line = f"{lead.phase} {lead.name}".strip()
+            if len(jobs) > 1:
+                line += f" (+{len(jobs) - 1} more)"
+            if activity is not None and activity.kind not in ("waiting", "tool"):
+                line += f"; the agent is {activity.kind} meanwhile"
+            return line
+        if activity is None or activity.kind == "waiting":
+            return "waiting for the workspace to start" if starting else ""
+        if activity.kind == "tool":
+            exe = phase_from_cmd(activity.cmd)[1] if activity.label == "bash" else ""
+            what = f"{activity.label}: {exe}" if exe else activity.label
+            if starting:
+                return f"{what}, waiting for the workspace to start"
+            return f"running {what}"
+        return activity.kind
+
+    def _narrate(self) -> None:
+        line = self.now_line()
+        with self._lock:
+            if line == self._narrated:
+                return
+            self._narrated = line
+        if not line:
+            return
+        narrate = getattr(self.view, "narration", None)
+        if narrate is None:
+            return
+        try:
+            narrate(line)
+        except Exception:  # noqa: BLE001 - presentation may not end a session
+            pass
 
     def facts_for_wake(self) -> list[str]:
         """Job facts in words, for the narration wake. Facts only: what the solver's
@@ -706,6 +873,11 @@ class Tracker:
         with self._lock:
             jobs = list(self._jobs.values())
         for job in jobs:
+            if job.felix is not None:
+                from .felix_progress import wake_line
+
+                lines.append(wake_line(job.name, job.felix, job.end_step))
+                continue
             facts = job.facts
             if facts.sim_time is None:
                 continue

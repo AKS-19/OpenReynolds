@@ -42,7 +42,7 @@ The agent decides everything about how to work. The harness is plumbing. Concret
 - inject step-by-step instructions, checklists, or mandated workflows — in the system prompt, in wake messages, or in any file the agent is required to obey;
 - grade, veto, or amend the model's outputs.
 
-**When the person chooses to be consulted.** Everything above holds, unchanged, in the default mode, `auto`: the briefing is the same bytes it was before modes existed and no tool call is ever held. The person may instead choose to be asked before compute is spent (`partial`: every `job_start` call is put to them before it runs) or to run a study in approved stages (`structured`: a `checkpoint` tool is offered, and `job_start` is held until a checkpoint has been approved). The harness then gates exactly what the person asked to have gated and nothing else. This is the same principle as `commands.py`: the user's own words about how they want to be heard, not the harness's opinion about how the model should work. The modes live in `modes.py`, the question and its answer in `approval.py`, and the one place a call is held is `Loop._consult`.
+**When the person chooses to be consulted.** Everything above holds, unchanged, in the default mode, `auto`: the briefing is the same bytes it was before modes existed and no tool call is ever held. The person may instead choose to be asked before compute is spent (`partial`: every `job_start` call is put to them before it runs) or to run a study in approved stages (`structured`: the `checkpoint` tool puts its summary to them, and `job_start` is held until a checkpoint has been approved; the tool is in the list in every mode, answering outside structured mode that checkpoints are structured mode's, because a session's system prompt and tool list never change mid-conversation and a switch reaches the model as a harness note). The harness then gates exactly what the person asked to have gated and nothing else. This is the same principle as `commands.py`: the user's own words about how they want to be heard, not the harness's opinion about how the model should work. The modes live in `modes.py`, the question and its answer in `approval.py`, and the one place a call is held is `Loop._consult`.
 
 There is no gate DAG, no state machine, no lock, no watchdog with authority, no budget the model must reason about. If the agent wants to write itself a spec, tests, or a checklist, it can — and nothing verifies that it did.
 
@@ -164,10 +164,13 @@ What exists today:
 
 - **Bring your own key** (the default, and the only mode for a self-hosted agent). The
   agent calls your provider directly with your key. The workspace service never sees it.
-- **The metered provider** (`OPENREYNOLDS_PROVIDER=reynolds`). The agent calls
-  `{service}/v1/llm` with its *workspace* key as the model key; the service swaps in the
-  platform's own credential, relays the request including streaming, and meters the
-  tokens into the same monthly budget as compute. No model key of your own.
+- **The metered provider** (`OPENREYNOLDS_PROVIDER=reynolds`). The agent speaks the
+  OpenAI Responses API to `{service}/v1/llm/v1` for GPT, or Anthropic's Messages API to
+  `{service}/v1/llm` for Claude -- the model picks which -- with its *workspace* key as
+  the model key; the service swaps in the platform's own credential (Azure for GPT,
+  Bedrock for Claude, which the agent neither knows nor needs to), relays the request
+  including streaming, and meters the tokens into the same monthly budget as compute.
+  No model key of your own.
 
 Neither is privileged in the code. `llm/presets.py` carries both, and `make_provider`
 cannot tell which it has.

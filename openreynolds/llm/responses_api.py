@@ -220,13 +220,34 @@ class ResponsesProvider(Provider):
         max_tokens: int,
         listener: Listener,
     ) -> Turn:
+        return self.with_fallback(
+            model,
+            lambda asked: self._stream_model(
+                asked, system=system, messages=messages, tools=tools,
+                effort=effort, max_tokens=max_tokens, listener=listener,
+            ),
+        )
+
+    def _stream_model(
+        self,
+        model: str,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        effort: str,
+        max_tokens: int,
+        listener: Listener,
+    ) -> Turn:
         items = self.render(messages)
         transport = self._transport_errors()
         progress: dict[str, bool] = {}
         for attempt in (1, 2, 3):
             kwargs = self._kwargs(model, system, items, tools, effort, max_tokens)
             try:
-                return self._stream_once(kwargs, listener, progress)
+                turn = self._stream_once(kwargs, listener, progress)
+                turn.model = turn.model or model
+                return turn
             except transport as exc:
                 # A reset mid-stream used to end the whole session: nothing between here
                 # and the top of the loop caught it, so one dropped connection threw away
@@ -325,10 +346,26 @@ class ResponsesProvider(Provider):
         )
 
     def complete(self, *, model: str, system: str, prompt: str, max_tokens: int) -> str:
+        """One short answer, for the front desk.
+
+        At the least effort, because `max_output_tokens` counts the reasoning too: the
+        desk's sixty-token "what is it doing now" line, at a reasoning model's default
+        effort, is spent thinking and arrives empty. An endpoint that refuses the
+        `reasoning` block is asked again without it, as a streamed turn would be."""
+        kwargs: dict[str, Any] = {
+            "model": model, "instructions": system, "input": prompt, "store": False,
+            "max_output_tokens": max(MIN_OUTPUT_TOKENS, max_tokens),
+        }
+        if not self.lean:
+            kwargs["reasoning"] = {"effort": "low"}
         try:
-            response = self.client.responses.create(
-                model=model, instructions=system, input=prompt, store=False,
-                max_output_tokens=max(MIN_OUTPUT_TOKENS, max_tokens))
+            response = self.client.responses.create(**kwargs)
+        except openai.BadRequestError as exc:
+            if "reasoning" in _message(exc).lower() and not self.lean:
+                self.lean = True
+                return self.complete(model=model, system=system, prompt=prompt,
+                                     max_tokens=max_tokens)
+            raise BadRequest(_message(exc)) from exc
         except openai.APIStatusError as exc:
             raise ProviderError(_message(exc), exc.status_code) from exc
         except openai.APIError as exc:
@@ -408,16 +445,19 @@ def _token_classes(usage: Any) -> dict[str, int]:
     `output_tokens` already includes the reasoning tokens, which is the honest total:
     they are generated, they are billed, and a run that spends its budget thinking has
     spent it. `input` is the uncached remainder so the classes still sum to the whole
-    request, and a cache write is never billed here."""
+    request. GPT-5.6 and later bill a cache write, at 1.25x input, and say so in
+    `input_tokens_details.cache_write_tokens`; an endpoint that does not report it
+    leaves the class at 0, as every one did before."""
     if usage is None:
         return {}
     total_in = int(getattr(usage, "input_tokens", 0) or 0)
     details = getattr(usage, "input_tokens_details", None)
     cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+    written = int(getattr(details, "cache_write_tokens", 0) or 0) if details is not None else 0
     return {
-        "input": max(0, total_in - cached),
+        "input": max(0, total_in - cached - written),
         "cache_read": cached,
-        "cache_write": 0,
+        "cache_write": written,
         "output": int(getattr(usage, "output_tokens", 0) or 0),
     }
 

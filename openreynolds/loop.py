@@ -14,9 +14,9 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable
 
-from . import modes
+from . import modes, solvers
 from .config import CONTEXT_REFRESH_FRACTION, CONTEXT_WINDOW_TOKENS, Config
-from .llm import BadRequest, Listener, Turn, make_provider
+from .llm import BadRequest, Listener, Turn, make_provider, refusal_line
 from .prompt import system_prompt
 from .store import Store
 from .tools import TOOLS, ToolContext, describe, dispatch, tools_for
@@ -56,6 +56,9 @@ LEFT_MID_TURN = (
 """The one line the transcript carries when a turn is ended by the person rather than by
 the model. In the harness's voice (`tell`): the person did not say it, and the model
 did not decide it."""
+
+ROUTING_STAGE = "choosing the solver"
+"""What the view and the bar say while an open solver is being routed (`Loop._route`)."""
 
 NOT_RUN_LEFT = "This call did not run: the person ended the session."
 """The result of a tool call the model asked for and the turn did not start, because the
@@ -116,6 +119,22 @@ class Loop:
         is being built and appended to when the answer lands, and neither of those
         may be interleaved with a write from elsewhere."""
         self._posted_lock = threading.Lock()
+        self._forwarded: list[tuple[str, str]] = []
+        """What the side chat passed on (`forward`): the person's own words from a
+        `/btw` question, and the side chat's optional note. Written from the side
+        chat's thread, so behind `_posted_lock`; drained by `_gather` with what was
+        typed, which is what makes a held wait end for it as it ends for a message."""
+        self.last_request: dict[str, Any] | None = None
+        """The arguments of the last request this thread sent: model, system, tools,
+        effort, max_tokens, and the messages as they were at that moment (a list of its
+        own; the thread goes on growing). The side chat's fork point (`desk.SideChat`):
+        a `/btw` question is this request again with one message appended, which is the
+        only shape that reads the whole conversation from the prompt cache."""
+        self.router: Callable[[str], str] | None = None
+        """For a study whose solver is still open (`auto`): settles it from the
+        person's first message, before the first request (`desk.route`, wired by
+        `cli.session`), and returns the briefing the thread opens with. None for a
+        study whose solver is known, which is every study once this has run."""
 
         headers = {"X-Study-Id": store.session.study_id}
         # Without a timeout a stalled connection is indistinguishable from a model
@@ -202,6 +221,12 @@ class Loop:
         self.messages.append({"role": "user", "content": text})
         self._record("event", text)
 
+    def event(self, text: str) -> None:
+        """Record a harness fact in the transcript only, for the person: nothing is
+        added to the thread, so the model is not told and the cache is not touched.
+        What a failed request leaves behind (`cli._run_turn`)."""
+        self._record("event", text)
+
     def inform(self, text: str) -> None:
         """Add harness-authored facts.
 
@@ -253,14 +278,43 @@ class Loop:
         self._notes = []
         return notes
 
+    def forward(self, words: str, note: str = "") -> bool:
+        """The side chat passing on a `/btw` question, from its own thread.
+
+        Delivered the way a message typed mid-turn is: the person's `words`, exactly as
+        they typed them, ride after this batch's tool results and are recorded as theirs
+        (`_gather`, `_turns`); the side chat's `note`, if it wrote one, follows as a
+        harness note that says whose it is. A held wait ends for it as for any message
+        (`heard`). Returns False when no turn is running to deliver it to -- the caller
+        then hands the words to the prompt like a typed line (`cli._deliver_forward`) --
+        and True when it is queued. Asked and answered under the same lock `run` takes
+        to say it has finished, so a forward can never land in a turn that has already
+        read its last message (`take_forwarded`)."""
+        with self._posted_lock:
+            if not self.running:
+                return False
+            self._forwarded.append((words, note))
+            return True
+
+    def take_forwarded(self) -> list[tuple[str, str]]:
+        """Whatever was forwarded after the turn's last drain. Empty unless the side
+        chat finished between the turn's last tool batch and its end."""
+        with self._posted_lock:
+            taken, self._forwarded = self._forwarded, []
+        return taken
+
     def set_mode(self, mode: str) -> str | None:
         """Switch how much the person is consulted. Returns the mode, or None if the
         name is not one.
 
         Takes effect at the next tool call: `_consult` reads `ctx.mode` every time.
         Entering structured mode starts it afresh, so a plan has to be approved in it
-        before compute is spent. The model is told in the harness's voice, because the
-        tool list and what gets held both change under it."""
+        before compute is spent. The model is told in the harness's voice, as a note in
+        a user turn (`tell`), because what gets held and what `checkpoint` does change
+        under it. Nothing else does: the system prompt never mentions the mode, and the
+        tool list is the same in every mode (`tools_for`) -- a list that changed here
+        would invalidate every thinking block in the thread on a provider that checks
+        what they are bound to."""
         canonical = modes.normalize(mode)
         if canonical is None:
             return None
@@ -296,11 +350,50 @@ class Loop:
             from . import switch
 
             switch.apply(self)
-        self.running = True
+        # Running from here, routing included: the routing request is this turn's
+        # first wait, and a turn that is choosing its solver is a turn in flight -- to
+        # the side chat's `forward`, and to anything asking whether the agent is busy.
+        with self._posted_lock:
+            self.running = True
         try:
+            if getattr(self.ctx, "solver", None) == solvers.AUTO and self.router is not None:
+                self._route()
             return self._turns()
         finally:
-            self.running = False
+            with self._posted_lock:
+                self.running = False
+
+    def _route(self) -> None:
+        """Settle an open solver before the first request, and open the thread.
+
+        The router (`cli.session`'s, which asks `desk.route`) reads what the person
+        said, fixes the solver, starts its workspace and returns the briefing; the
+        briefing goes in front of what the person said, where `brief` would have put
+        it had it been known before they spoke. The request that follows is the first
+        this thread sends, with the chosen solver's prompt and tools -- and so is every
+        request after it."""
+        said = next(
+            (m["content"] for m in reversed(self.messages)
+             if m.get("role") == "user" and isinstance(m.get("content"), str)),
+            "",
+        )
+        router, self.router = self.router, None
+        # Said, because nothing else is: the routing request and the workspace's
+        # reservation take seconds -- 14 in the first production study routed this way
+        # (20261019-013223-f805) -- before the first streamed token, which is what used
+        # to tell a view the agent was working. Without this the hosted page still read
+        # "your turn" from its idle prompt, an MCP caller polling it was told the
+        # agent had finished its turn with nothing in the transcript, and ended the
+        # study. A stage and the bar, not a draft: no model output is on its way yet.
+        self.view.working(ROUTING_STAGE)
+        self._busy(ROUTING_STAGE)
+        try:
+            briefing = router(said)
+        finally:
+            self._unbusy()
+        if briefing:
+            self.messages.insert(0, {"role": "user", "content": briefing})
+            self._record("event", briefing)
 
     def _turns(self) -> Turn:
         step = 0
@@ -313,9 +406,10 @@ class Loop:
             self._drain_posted()
             response = self._send()
 
+            if response.declined:
+                self._fell_back(response)
             if response.stop_reason == "refusal":
-                reason = response.stop_explanation or "no explanation given"
-                self.view.notice(f"The model declined this request: {reason}")
+                self.view.notice(refusal_line(response))
                 return response
 
             self.messages.append(response.as_message())
@@ -444,6 +538,9 @@ class Loop:
         said = self.interject() if self.interject else None
         if said:
             self._typed.append(said)
+        for words, note in self.take_forwarded():
+            self._typed.append(words)
+            self.tell(forwarded_note(note))
 
     def heard(self) -> bool:
         """Whether the person has said something the model has not seen yet.
@@ -476,6 +573,49 @@ class Loop:
         """
         self._gather()
         return bool(self._typed)
+
+    def take_typed(self) -> None:
+        """Put words `heard` gathered between turns into the thread as a user message.
+
+        Inside a turn they ride with the next batch's tool results. Between a failed
+        request and its retry (`cli._run_turn`) there is no batch to ride with, and
+        words left in `_typed` would wait for one that might never come."""
+        said = "\n".join(self._typed) or None
+        self._typed = []
+        if said:
+            self.view.interjection(said)
+            self.say(said)
+
+    def _fell_back(self, response: Turn) -> None:
+        """The model asked for declined this request and another answered it (or
+        declined too): say so, and when one answered, make it the session's model.
+
+        The vendor's advice for a multi-turn conversation is to stay on the model that
+        accepted rather than switch back, and the provider already pins the pair
+        (`Provider.pinned`). Moving `cfg.model` as well keeps `/model` and the status
+        line honest about who is answering, and it is what `/model <the first one>`
+        undoes -- `switch.apply` clears the pin with the switch. Done here, between two
+        complete assistant turns, the same moment a `/model` switch is applied."""
+        if response.stop_reason == "refusal":
+            return  # `refusal_line` says it all in the caller
+        from . import switch
+
+        asked = response.declined[0][0]
+        served = response.model
+        self.view.notice(
+            f"{refusal_line(response)} The session stays on {served}; "
+            f"/model {asked} goes back."
+        )
+        if served == self.cfg.model or not served:
+            return
+        self.cfg.model = served
+        # The declined model's reasoning blocks carry its signature; the one that
+        # answered is the one that will be asked next, so they go the way they do on
+        # any other switch.
+        switch.strip_thinking(self.messages)
+        self.store.session.model = served
+        self.store.save()
+        self.view.model(self.cfg.model, self.cfg.effort, self.cfg.provider)
 
     def _send(self) -> Turn:
         """One streamed request, printing as it arrives."""
@@ -515,7 +655,7 @@ class Loop:
         """
         image_results = []
         carried = 0
-        for message in self.messages:
+        for at, message in enumerate(self.messages):
             if message.get("role") != "user":
                 continue
             content = message.get("content")
@@ -528,7 +668,7 @@ class Loop:
                 if isinstance(inner, list) and any(
                     isinstance(b, dict) and b.get("type") == "image" for b in inner
                 ):
-                    image_results.append(block)
+                    image_results.append((at, block))
                     carried += _image_bytes(inner)
         # Nothing is evicted while the thread is under the byte budget. Every eviction
         # rewrites a block in the middle of the conversation and so invalidates the
@@ -536,7 +676,10 @@ class Loop:
         # picture of a study, to save re-reading tokens that cost a tenth as much.
         if carried <= LIVE_IMAGE_BUDGET:
             return
-        for block in image_results[: max(0, len(image_results) - keep)]:
+        evicted = image_results[: max(0, len(image_results) - keep)]
+        if evicted:
+            self._unbind_after(evicted[0][0])
+        for _, block in evicted:
             inner = block["content"]
             note = next(
                 (b.get("text", "") for b in inner if isinstance(b, dict) and b.get("type") == "text"),
@@ -570,13 +713,20 @@ class Loop:
                 self._busy("writing")
             self.view.text_delta(delta)
 
-        response = self.provider.stream(
+        request = dict(
             model=self.cfg.model,
-            system=system_prompt(),
+            system=system_prompt(getattr(self.ctx, "solver", "openfoam")),
             messages=self.messages,
             tools=tools_for(self.ctx),
             effort=self.cfg.effort,
             max_tokens=MAX_TOKENS,
+        )
+        # Kept before it is sent, with a list of its own: the side chat forks from
+        # exactly this, and a request that fails is still the last one the provider
+        # has a cached prefix for.
+        self.last_request = {**request, "messages": list(self.messages)}
+        response = self.provider.stream(
+            **request,
             listener=Listener(
                 thinking_begin=lambda: self.view.thinking_begin(),
                 thinking=lambda delta: self.view.thinking_delta(delta),
@@ -622,8 +772,14 @@ class Loop:
     def _run_tool(self, block: Any) -> dict[str, Any]:
         self.view.tool(block.name, _summarize(block.input))
         tool_input = dict(block.input)
-        refused = self._consult(block.name, tool_input)
-        if refused is not None:
+        offered = block.name in {tool["name"] for tool in tools_for(self.ctx)}
+        refused = self._consult(block.name, tool_input) if offered else None
+        if not offered:
+            # Not offered is not served: the same answer as a tool that does not exist.
+            # Before the solver is chosen this is every machine tool, and serving one
+            # would wait on a workspace nobody has started.
+            content, is_error = f"No such tool: {block.name}", True
+        elif refused is not None:
             content, is_error = refused, True
         elif block.name == modes.CHECKPOINT:
             # A question to a person: no mirror gate held while they think, and no
@@ -787,10 +943,34 @@ class Loop:
                     out.append(block)
             return out
 
-        for message in self.messages:
+        first = None
+        for at, message in enumerate(self.messages):
             if isinstance(message, dict):
+                before = dropped
                 message["content"] = clean(message.get("content"))
+                if dropped > before and first is None:
+                    first = at
+        if first is not None:
+            self._unbind_after(first)
         return dropped
+
+    def _unbind_after(self, index: int) -> None:
+        """Take the reasoning blocks out of every assistant turn after `index`, the
+        first message about to be rewritten.
+
+        A thinking block is bound to everything before it -- the system prompt, the
+        tool list and the messages. Measured against Anthropic's API with the binding
+        checked strictly (`prefix_mismatch_behavior: "error"`, which is how Bedrock
+        behaves): a thread replayed with an earlier user message edited is refused,
+        `400 messages.1.content.0: Invalid signature in thinking block. The block is
+        bound to a different conversation`, and the same thread with that block taken
+        out goes through. Image eviction and `drop_images` both rewrite an earlier
+        message, so the turns after it lose their reasoning blocks -- the words and
+        tool calls beside them stay, which is what carries the reasoning forward.
+        Blocks before the rewritten message keep their prefix and are kept."""
+        from . import switch
+
+        switch.strip_thinking(self.messages[index + 1:])
 
     def restart(self, blurb: str) -> None:
         """Begin a fresh thread from a factual situation blurb."""
@@ -850,6 +1030,21 @@ def _image_bytes(blocks: list) -> int:
             source = block.get("source") or {}
             total += len(source.get("data") or "")
     return total
+
+
+def forwarded_note(note: str = "") -> str:
+    """The harness's line beside words the side chat passed on (`Loop.forward`).
+
+    The words themselves arrive as the person's, untouched, exactly as a message typed
+    mid-turn does; this says only how they came, so they are not read as an answer to
+    whatever was last asked. The side chat's own note, when it wrote one, is quoted
+    here and labelled as the side chat's -- never folded into the person's words."""
+    line = ("The person's message just above was asked as a side question (/btw), "
+            "answered apart from this conversation, and passed on to you in their own "
+            "words.")
+    if note and note.strip():
+        line += f" The side chat's own note, not the person's: {note.strip()}"
+    return line
 
 
 def _as_operator_text(text: Any) -> str:

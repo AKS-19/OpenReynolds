@@ -504,3 +504,28 @@ def test_the_bar_shows_for_real_work_and_hides_otherwise():
     assert not _bar_worth_showing(Progress("thinking", "thinking · 12 s", "", None, True, 1))
     assert not _bar_worth_showing(Progress("writing", "writing · 3 s", "", None, True, 1))
     assert not _bar_worth_showing(Progress("waiting", "waiting for you", "", None, False, 1))
+
+
+def test_the_now_line_comes_from_the_tracker_with_no_model_and_no_clock():
+    """The front desk wrote this line with a model call every couple of minutes. It is
+    the bar's own knowledge in words now, said when it changes and not every second."""
+    from openreynolds.progress import Tracker
+
+    told = []
+
+    class View:
+        def progress(self, snapshot):
+            pass
+
+        def narration(self, text):
+            told.append(text)
+
+    tracker = Tracker(View())
+    tracker.begin("thinking")
+    tracker.push()
+    tracker.push()
+    tracker.begin("tool", "bash", cmd="blockMesh")
+    tracker.idle()
+    tracker.begin("writing")
+
+    assert told == ["thinking", "running bash: blockMesh", "writing"]

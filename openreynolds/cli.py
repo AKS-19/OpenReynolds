@@ -27,15 +27,16 @@ from .browse import Browser
 from . import casebundle
 from .capture import Capture
 from . import cad, commands, images, switch
-from . import convergence, modes
+from . import convergence, modes, solvers
 from .approval import Approver
-from .llm.presets import EFFORTS, models_for
+from .llm.presets import EFFORTS, context_window_for, desk_model_for, models_for, serves, successor
 from .config import Config, config_path
 from .delivery import Gallery
-from .llm import PRESETS, ProviderError, make_provider, preset_for
-from .loop import Loop
+from .llm import PRESETS, REYNOLDS, ProviderError, make_provider, preset_for
+from .llm import base as llm_base
+from .loop import Loop, forwarded_note
 from . import video as video_mod
-from .desk import Concierge
+from .desk import OFF as SIDE_OFF, SideChat, route as route_solver, routed_line, routed_notice
 from .mirror import LiveMirror, local_for, sync as mirror_sync
 from .progress import Tracker
 from .stopping import running_solvers, stop_everything
@@ -148,6 +149,14 @@ def _terminal_json(outcome: str, error: str, study_id: str = "") -> None:
          "(approve a plan and each stage).",
 )
 @click.option(
+    "--solver",
+    type=click.Choice(solvers.CHOICES, case_sensitive=False),
+    default=None,
+    help="auto (the agent chooses, the default), openfoam or felix (GPU); or "
+         "OPENREYNOLDS_SOLVER. Fixed for the whole study: a resumed study keeps the "
+         "solver it has.",
+)
+@click.option(
     "--effort",
     type=click.Choice(EFFORTS, case_sensitive=False),
     help="How hard the model thinks this session. /effort changes it mid-study.",
@@ -182,6 +191,7 @@ def main(
     model: str | None,
     effort: str | None,
     mode: str | None,
+    solver: str | None,
     no_capture: bool,
     plain: bool,
     keep_alive: bool,
@@ -259,6 +269,7 @@ def main(
         output_format=output_format,
         mode_explicit=mode_explicit,
         model_explicit=model_explicit,
+        solver=solver,
     )
     code = ONE_SHOT_EXIT_CODES.get(outcome or "ok", 0)
     if code:
@@ -366,6 +377,12 @@ def config_cmd(from_env: bool, key_file: Path | None, provider: str | None) -> N
                 "Model API key", default=cfg.llm_api_key or "", hide_input=True
             ).strip()
         cfg.model = click.prompt("Model", default=cfg.model).strip()
+        if chosen_preset is not None and chosen_preset.name == REYNOLDS:
+            # The service serves two families; the desk and the window follow the one
+            # the model just typed is in, or a Claude study is narrated by GPT's desk
+            # model through Claude's route and capped at GPT's window.
+            cfg.desk_model = desk_model_for(REYNOLDS, cfg.model)
+            cfg.context_window = context_window_for(cfg.model) or chosen_preset.context_window
     except (click.Abort, EOFError):
         # Some shells report a terminal and then deliver EOF, so isatty() alone cannot
         # tell whether prompting will work. Explain rather than dying on "Aborted!".
@@ -577,7 +594,7 @@ def _print_settings(cfg: Config) -> None:
         ("service url", cfg.foamd_url),
         ("service key", _redact(cfg.foamd_api_key)),
         ("provider", cfg.provider),
-        ("model key", "via the service key" if cfg.provider == "reynolds" else _redact(cfg.llm_api_key)),
+        ("model key", "via the service key" if cfg.provider == REYNOLDS else _redact(cfg.llm_api_key)),
         ("model", cfg.model),
     ):
         console.print(f"  {name:14} {value or '[red]not set[/]'}")
@@ -1155,8 +1172,13 @@ def session(
     interface: Any = None,
     mode_explicit: bool | None = None,
     model_explicit: bool | None = None,
+    solver: str | None = None,
 ) -> str | None:
     """Run one study to its end.
+
+    `solver` is `auto`, `openfoam` or `felix` (`solvers.py`), as `--solver` gives it;
+    None reads `OPENREYNOLDS_SOLVER`, and with neither the agent chooses (`auto`). A
+    resumed study keeps the solver it has (`_settle_solver`).
 
     `interface`, when given, is a callable that takes `drive` -- the one-session
     function below, `drive(view, reader)` -- and runs it against an interface of its
@@ -1215,6 +1237,25 @@ def session(
     stored_model = (store.session.model or "").strip()
     stored_provider = (store.session.provider or "").strip()
     stored_base_url = (store.session.base_url or "").strip()
+    if (
+        resuming
+        and stored_model
+        and stored_provider
+        and not model_explicit
+        and not serves(stored_provider, stored_model)
+    ):
+        # A record no provider can honour any more: a study run on Reynolds' model
+        # before the 5.5 models names `claude-opus-5`, which the service no longer
+        # meters. Restored as recorded, it is a 4xx on the first turn; refused as below,
+        # the study would keep a record nothing can serve and say so on every resume.
+        # So the study stays on Reynolds' model -- on Claude's successor when it was on
+        # Claude, the default otherwise -- and the record is rewritten with that pair.
+        retired = stored_model
+        stored_model = successor(stored_provider, stored_model)
+        console.print(
+            f"[yellow]This study was last on {retired} ({stored_provider}), which "
+            f"{stored_provider} no longer serves, so it carries on on {stored_model}.[/]"
+        )
     restore_refused = False
     """Whether this run could not honour the pair the study recorded.
 
@@ -1272,6 +1313,43 @@ def session(
     inheriting the shared workspace root."""
 
     local = bool(os.environ.get("OPENREYNOLDS_LOCAL"))
+    asked = solvers.normalize(solver) or solvers.normalize(os.environ.get("OPENREYNOLDS_SOLVER"))
+    stored = store.recorded_solver
+    if resuming and not local and not (store.dir / "session.json").is_file():
+        # A study this machine never held: its record is the platform's, and the
+        # workspace about to be reserved has to be of its solver's kind.
+        with _timed("study_solver"):
+            found, reachable = hosted.study_solver(cfg.foamd_url, cfg.foamd_api_key, study_id)
+        if found:
+            stored = found
+        elif solvers.chosen(asked):
+            stored = asked  # nothing on record anywhere: the flag is the choice
+        elif not reachable:
+            console.print(
+                "[yellow]Could not read this study's solver from the platform, and "
+                "this machine has no record of it. It runs as OpenFOAM; if it is a "
+                "Felix study, end this session and resume with --solver felix.[/]"
+            )
+    settled = _settle_solver(stored, asked, resuming=resuming, local=local)
+    if resuming and solvers.chosen(asked) and asked != settled:
+        console.print(
+            f"[yellow]This study's solver is {settled}; --solver {asked} is "
+            "ignored: the solver does not change during a study.[/]"
+        )
+    if local and settled == solvers.FELIX:
+        console.print(
+            "[red]Felix runs only through the hosted workspace service[/] -- its "
+            "solves go to cloud GPUs -- so it cannot run on a local workspace "
+            "(OPENREYNOLDS_LOCAL). Unset it, or pass --solver openfoam."
+        )
+        if streaming_json:
+            _terminal_json("config", "felix needs the hosted workspace service",
+                           store.session.study_id)
+        raise SystemExit(2)
+    # Recorded as soon as it is known: with the record written below, before the
+    # header goes out; for a study still choosing, `null` until its first message has
+    # been routed (`desk.route`, before the agent's first request).
+    store.session.solver = settled if solvers.chosen(settled) else None
     starter: Any = None
     pending: PendingBackend | None = None
     """The workspace as a promise, while it is coming up. None for a workspace that
@@ -1284,6 +1362,15 @@ def session(
             backend = LocalBackend()
             client, resolved_instance = None, "local"
             console.print(f"[dim]local workspace: {backend.workspace_root}[/]")
+        elif settled == solvers.AUTO:
+            # The solver is chosen from the person's first message, and a workspace
+            # has one kind: nothing is reserved, started or opened on the platform
+            # until it has been (`desk.route`, then `begin_workspace` in `drive`,
+            # both before the agent's first request). Every tool that would need the
+            # machine waits on this promise.
+            client, resolved_instance = None, ""
+            pending = PendingBackend("")
+            backend = pending
         else:
             # Which workspace, settled now; the workspace itself, started now and
             # waited for later. `reserve` is a fraction of a second of database;
@@ -1297,6 +1384,7 @@ def session(
                     cfg.foamd_url,
                     cfg.foamd_api_key,
                     instance_id or store.session.instance_id or None,
+                    **_kind(settled),
                 )
             starter.start()
             pending = starter.pending()
@@ -1361,10 +1449,15 @@ def session(
                 capture = Capture.start(
                     client, store.session.title or store.session.study_id, resolved_instance,
                     study_id=store.session.study_id, home=store.session.home, warn=_warn,
+                    **_kind(settled),
                 )
             if capture:
                 store.session.remote_study_id = capture.study_id
                 store.save()
+    elif cfg.capture and settled == solvers.AUTO and not local:
+        # The platform's study is opened with its solver, so not before the choice;
+        # what is said meanwhile is held and posted once it is (`Capture.deferred`).
+        capture = Capture.deferred(warn=_warn)
     if store.session.remote_study_id:
         # The workspace is told which study it is serving, under the platform's own
         # name for it: the row just opened, or the one this study was resumed on
@@ -1385,6 +1478,7 @@ def session(
         home=store.session.home,
         on_fetch=_fetch_hook(capture),
         mode=cfg.mode,
+        solver=settled,
     )
     browser = Browser(backend, store, home=store.session.home)
     live_mirror = LiveMirror(browser, interval_s=cfg.mirror_interval_s)
@@ -1439,14 +1533,6 @@ def session(
             local_dir=store.fetch_dir(),
         )
         live_mirror.progress = tracker
-        # The front desk: a second cheap agent that answers the user while this one
-        # is mid-turn. Off without a key (BYOK) or when disabled. One-shot runs have
-        # nobody at the keyboard, so it does not run there.
-        concierge = None
-        if cfg.desk and not cfg.model_key_missing() and getattr(reader, "accepts_input", True):
-            concierge = Concierge(cfg, store, view, tracker)
-            tracker.concierge = concierge
-            concierge.start()
         tracker.start()
         live_mirror.start()
         # The browser is handed over now whether or not the workspace is up: a view
@@ -1457,6 +1543,13 @@ def session(
         with _timed("view_workspace"):
             view.workspace(browser)
         loop = Loop(cfg, ctx, store, view, capture=capture, progress=tracker)
+        # The side chat: `/btw <question>` answered by a fork of this loop's last
+        # request, apart from the conversation (`desk.SideChat`). Off without a key or
+        # when disabled; a one-shot run has nobody to ask one.
+        side = None
+        if cfg.desk and not cfg.model_key_missing() and getattr(reader, "accepts_input", True):
+            side = SideChat(loop, view, deliver=lambda words, note: _deliver_forward(
+                loop, reader, words, note))
         # The mirror's cycles share the container with the model's commands, and a
         # command waited minutes behind a cycle's transfers. Held around each tool
         # call, this is how a cycle knows to stand aside (mirror.Gate).
@@ -1465,6 +1558,8 @@ def session(
         # a reader somebody can type into can answer a question; -p has refused a
         # non-auto mode before getting here, so no approver means nothing is asked.
         view.mode(ctx.mode)
+        if solvers.chosen(ctx.solver):
+            view.solver(ctx.solver)
         # Effort and provider too, which header() does not carry: the interface's bar
         # shows them and `/model ` completes from the provider's known models.
         view.model(cfg.model, cfg.effort, cfg.provider)
@@ -1472,6 +1567,7 @@ def session(
             approver = Approver(
                 view, reader,
                 local=lambda command: _local(command, view, browser, store, loop, tracker),
+                side=side.ask if side is not None else None,
             )
             loop.approver = approver
             ctx.approver = approver
@@ -1488,7 +1584,10 @@ def session(
         # any mesh under the workspace, whoever built it. `OPENREYNOLDS_CAD_REVIEW=0`
         # takes it away from the desk only; that is the A/B, and the tool stays.
         reviewer = None
-        if not cfg.model_key_missing():
+        # Both build and judge OpenFOAM meshes; a Felix study is offered neither
+        # (`tools_for`), so neither is built for one.
+        openfoam_tools = ctx.solver != solvers.FELIX
+        if openfoam_tools and not cfg.model_key_missing():
             with _timed("review"):
                 reviewer = cad.Reviewer(
                     cfg, backend,
@@ -1496,7 +1595,7 @@ def session(
                                                         store=store, capture=capture),
                 )
             ctx.reviewer = reviewer
-        if cfg.mesh_tool and not cfg.model_key_missing():
+        if openfoam_tools and cfg.mesh_tool and not cfg.model_key_missing():
             # `interject` is read late on purpose: the loop's own drain is attached a
             # few lines below, and the desk needs the same one. It is what lets a
             # person change the shape while it is being built instead of waiting out
@@ -1515,7 +1614,7 @@ def session(
                     reviewer=reviewer if cfg.cad_review else None,
                 )
         loop.interject = lambda: _typed_while_working(
-            loop, view, browser, store, reader, progress=tracker, concierge=concierge
+            loop, view, browser, store, reader, progress=tracker, side=side
         )
         # A held job_check ends early the moment the person says something
         # for the model -- asked of the loop, whose drain (just above) is the one thing
@@ -1528,22 +1627,27 @@ def session(
         # the loop (`Loop.leave`), the wait asks it, and the turn stops after this
         # batch's results instead of at the model's next reply.
         ctx.on_leaving = lambda: getattr(loop, "leaving", False)
-        with _timed("situation_brief"):
-            briefing = _situation_brief(
-                store,
-                backend,
-                resuming,
-                interactive=not one_shot,
-                # The listing and the core count are questions to the workspace; for
-                # one still coming up they are asked when it is here (`_bring_up`),
-                # and the briefing says instead that it is coming.
-                browser=browser if pending is None else None,
-                preferences=cfg.preferences,
-                mode=ctx.mode,
-                starting_eta_s=cfg.workspace_eta_s if pending is not None else None,
-            )
-        with _timed("loop_brief"):
-            loop.brief(briefing)
+        routing = starter is None and pending is not None
+        """The solver is still open: it is chosen from the person's first message, and
+        the briefing -- which says which solver and that its workspace is starting --
+        is written then (`route_study`), in front of that message."""
+        if not routing:
+            with _timed("situation_brief"):
+                briefing = _situation_brief(
+                    store,
+                    backend,
+                    resuming,
+                    interactive=not one_shot,
+                    # The listing and the core count are questions to the workspace;
+                    # for one still coming up they are asked when it is here
+                    # (`_bring_up`), and the briefing says instead that it is coming.
+                    browser=browser if pending is None else None,
+                    preferences=cfg.preferences,
+                    mode=ctx.mode,
+                    starting_eta_s=cfg.workspace_eta_s if pending is not None else None,
+                )
+            with _timed("loop_brief"):
+                loop.brief(briefing)
         if pending is None:
             # The toolbox must be on the instance before the first tool call can ask
             # for it; by now the upload has had the whole briefing to finish.
@@ -1551,6 +1655,99 @@ def session(
                 toolbox_sync.result()
                 toolbox_pool.shutdown(wait=False)
             _say_workspace_ready(view, resolved_instance, 0.0)
+        elif routing:
+            # The solver is still open. It is chosen from the person's first message,
+            # by a request of its own before the agent's first (`route_study`, which
+            # the loop calls from `run`); the workspace of that kind is reserved,
+            # started and opened on the platform then (`begin_workspace`), and the
+            # agent's first request already carries that solver's prompt and tools.
+            # It used to be the agent's own first decision, through a `choose_solver`
+            # tool, and the prompt and tools were swapped under it once it had made
+            # it -- which a provider that binds thinking to the prompt refuses
+            # (`desk.py` has the 400).
+
+            def begin_workspace(chosen: str) -> str:
+                nonlocal starter
+                try:
+                    with _timed("reserve"):
+                        chosen_client, chosen_instance, chosen_starter = hosted.reserve(
+                            cfg.foamd_url, cfg.foamd_api_key, instance_id or None,
+                            **_kind(chosen),
+                        )
+                except BackendError as exc:
+                    pending.fail(exc)
+                    console.print(f"[red]Could not reach the workspace service:[/] {exc}")
+                    view.notice(f"the workspace could not be started: {exc}")
+                    return (
+                        f"The workspace could not be reserved ({exc}); every tool call "
+                        "will fail with that error until the session is resumed."
+                    )
+                starter = chosen_starter
+                chosen_starter.start()
+                pending.bind(
+                    chosen_instance,
+                    instances_held=getattr(chosen_starter, "instances_held", 0),
+                    was_already_running=getattr(chosen_starter, "listed_as_running", False),
+                    closer=getattr(chosen_client, "close", None),
+                )
+                store.session.instance_id = chosen_instance
+                if isinstance(capture, Capture) and chosen_client is not None:
+                    with _timed("capture_start"):
+                        opened = capture.open(
+                            chosen_client,
+                            store.session.title or store.session.study_id,
+                            chosen_instance,
+                            study_id=store.session.study_id,
+                            home=store.session.home,
+                            **_kind(chosen),
+                        )
+                    if opened:
+                        store.session.remote_study_id = capture.study_id
+                        pending.study_id = capture.study_id
+                store.save()
+                tracker.workspace_starting(cfg.workspace_eta_s)
+                bringing_up.set()
+                threading.Thread(
+                    target=_bring_up,
+                    args=(pending, chosen_starter, store, view, loop, tracker, browser,
+                          resuming),
+                    name="workspace-ready",
+                    daemon=True,
+                ).start()
+                return (
+                    f"Its workspace is starting, usually in about "
+                    f"{cfg.workspace_eta_s:.0f} seconds; a call that needs it waits for it."
+                )
+
+            def route_study(said: str) -> str:
+                """Choose the solver from `said`, start its workspace, and return the
+                briefing the thread opens with (`Loop._route`)."""
+                with _timed("route"):
+                    chosen = route_solver(loop.provider, cfg.model, said)
+                loop.add_tokens(chosen.tokens)
+                ctx.solver = chosen.solver
+                store.session.solver = chosen.solver
+                store.save()
+                view.solver(chosen.solver)
+                view.notice(routed_notice(chosen))
+                if chosen.failed:
+                    console.print(f"[yellow]{routed_notice(chosen)}[/]")
+                started = begin_workspace(chosen.solver)
+                with _timed("situation_brief"):
+                    briefing = _situation_brief(
+                        store, backend, resuming, interactive=not one_shot,
+                        preferences=cfg.preferences, mode=ctx.mode,
+                        starting_eta_s=cfg.workspace_eta_s,
+                    )
+                head, _, rest = briefing.partition("\n")
+                lines = [head, routed_line(chosen)]
+                if starter is None:
+                    # The reservation failed: `begin_workspace` said why, and every
+                    # tool call will fail with it.
+                    lines.append(started)
+                return "\n".join([*lines, rest] if rest else lines)
+
+            loop.router = route_study
         else:
             # The workspace is coming up on its own thread; this one runs the
             # conversation. When it is here, `_bring_up` makes it this study's --
@@ -1574,7 +1771,7 @@ def session(
             else:
                 _run_interactive(
                     loop, backend, store, view, browser, reader,
-                    live=live_mirror, progress=tracker, concierge=concierge,
+                    live=live_mirror, progress=tracker, side=side,
                     cad=ctx.cad,
                 )
         except KeyboardInterrupt:
@@ -1582,9 +1779,9 @@ def session(
         finally:
             with _timed("close.tracker_stop"):
                 tracker.stop()
-            if concierge is not None:
-                with _timed("close.concierge_stop"):
-                    concierge.stop()
+            if side is not None:
+                with _timed("close.side_stop"):
+                    side.stop()
 
     force_exit = False
     stream: JsonView | None = None
@@ -1633,6 +1830,12 @@ def session(
         # it rides alongside rather than in front: every step of the close-down is a
         # round trip the person is waiting on.
         live_mirror.view = None
+        never_started = pending is not None and starter is None
+        """A study that ended with its solver still to choose: nothing was reserved,
+        started or opened, and there is nothing to bring home or put down."""
+        if never_started:
+            pending.fail(BackendError("no solver was chosen, so no workspace was started",
+                                      code="no_solver"))
         if pending is not None and not bringing_up.is_set() and not pending.ready_event.is_set():
             # `drive` never reached the point of bringing the workspace up -- an
             # interface that would not start, an error on the way -- so the start
@@ -1643,7 +1846,9 @@ def session(
                 pending.resolve(starter.result())
             except BackendError as exc:
                 pending.fail(exc)
-        if pending is not None and not pending.ready():
+        if never_started:
+            console.print("[dim]no solver was chosen, so no workspace was started[/]")
+        elif pending is not None and not pending.ready():
             # The workspace never came, or has not come yet: nothing of this study's
             # is on it, so there is nothing to pick up and nothing to bring home,
             # and waiting for it to say so would be the wait this whole arrangement
@@ -1662,8 +1867,12 @@ def session(
                 _capture_the_case(capture, store, ConsoleView(console))
             with _timed("close.capture_close"):
                 capture.close()
-        with _timed("close.close_down"):
-            _close_down(backend, store, keep_alive=keep_alive)
+        if never_started:
+            console.print(f"\n[dim]this study's files are in {store.dir}[/]")
+            console.print(f"[dim]  resume: openreynolds --study {store.session.study_id}[/]")
+        else:
+            with _timed("close.close_down"):
+                _close_down(backend, store, keep_alive=keep_alive)
         with _timed("close.backend_close"):
             backend.close()
         if stream is not None:
@@ -1692,6 +1901,33 @@ the traceback is worth more than a tidy exit -- and it is mapped anyway so that 
 embedder which swallows the exception cannot turn a crash into a zero."""
 
 WORKSPACE_LISTED = 40
+
+
+def _settle_solver(stored: str | None, asked: str | None, *, resuming: bool, local: bool) -> str:
+    """This study's solver: `openfoam`, `felix`, or `auto` for the agent to choose.
+
+    `stored` is what the study's record says (`Store.recorded_solver`); `asked` is
+    the flag or the environment, None for neither, which leaves it to the agent.
+
+    A resumed study keeps the solver it has, whatever is asked: the workspace it binds
+    to has that kind, and its cases are that solver's. One recorded before solvers
+    existed is an OpenFOAM study. One whose choice was left to the agent and never
+    made is still open, and there a `--solver` is a choice rather than a conflict. A
+    local workspace has only OpenFOAM, so on one there is nothing to choose.
+    """
+    stored = solvers.normalize(stored)
+    wanted = solvers.normalize(asked) or solvers.AUTO
+    if resuming and stored != solvers.AUTO:
+        return stored if stored in solvers.SOLVERS else solvers.OPENFOAM
+    if wanted == solvers.AUTO and local:
+        return solvers.OPENFOAM
+    return wanted
+
+
+def _kind(solver: str) -> dict[str, str]:
+    """`solver=` for the calls that take one, given only for Felix: an OpenFOAM study
+    makes exactly the calls it always made, and the service's default is OpenFOAM."""
+    return {"solver": solver} if solver == solvers.FELIX else {}
 
 
 def _recover_session(store: Store, client: Any, study_id: str | None) -> None:
@@ -1723,6 +1959,10 @@ def _recover_session(store: Store, client: Any, study_id: str | None) -> None:
         store.session.instance_id = str(row["instance_id"])
     if row.get("title") and not store.session.title:
         store.session.title = str(row["title"])
+    if solvers.chosen(str(row.get("solver") or "")) and not solvers.chosen(store.session.solver):
+        # The platform's record of a study opened elsewhere. This session's workspace
+        # was settled before the row could be read; the next resume reads it here.
+        store.session.solver = str(row["solver"]).lower()
 
 
 def _home_for(store: Store, backend: Backend, resuming: bool, known_here: bool = True) -> str:
@@ -1980,13 +2220,18 @@ def _situation_brief(
     that usually takes. The briefing then carries that fact in place of the two it
     would have had to wait for -- the listing and the core count -- and those follow
     as a note once the workspace is here (`_workspace_ready_note`).
+
+    A study whose solver was left open is briefed only once it has been chosen, from
+    the person's first message (`route_study` in `session`): its workspace is then
+    starting like any other, and the briefing is this one with the choice beside it.
     """
     lines = []
+    waiting = starting_eta_s is not None
     if resuming:
         # `situation` re-reads every running job's status from the workspace, which a
         # resume ahead of its workspace cannot do yet: there it says what the study
         # recorded, and the ready note re-reads it.
-        lines.append(situation(store, None if starting_eta_s is not None else backend))
+        lines.append(situation(store, None if waiting else backend))
     else:
         lines.append(f"study {store.session.study_id} on instance {store.session.instance_id}.")
     if starting_eta_s is not None:
@@ -2182,7 +2427,7 @@ def _bring_up(
             if browser is not None:
                 browser.home = WORKSPACE_ROOT
             tracker.home = WORKSPACE_ROOT
-        _sync_toolbox_timed(live)
+        _sync_toolbox_timed(live, store.session.solver)
         pending.resolve(live)
         seconds = pending.elapsed_s
         tracker.workspace_ready()
@@ -2725,15 +2970,22 @@ def _apply(
     progress: Any = None,
     cad: Any = None,
     backend: Backend | None = None,
+    side: Any = None,
 ) -> Any:
     """Act on one typed line. Returns what goes to the model, or None, or QUIT."""
     if command.kind == commands.EXIT:
         return QUIT
-    if command.kind in (commands.SAY, commands.ASIDE):
+    if command.kind == commands.SAY:
         if not command.text:
             return None
         loop.say(command.text)
         return command.text
+    if command.kind == commands.ASIDE:
+        # A side question, typed at the prompt or while a job runs: answered on the
+        # side chat's thread, and nothing goes to the model. What it passes on comes
+        # back to this prompt as a typed line would (`_deliver_forward`).
+        _ask_aside(command, view, side)
+        return None
     if command.kind == commands.MESH:
         # Answered here, like `/status`: it is the person's own instruction to the
         # desk, so putting a turn in front of it would be the paraphrase this exists
@@ -2782,6 +3034,53 @@ def _mesh_here(
     view.info(cad_text(result))
 
 
+def _ask_aside(command: commands.Command, view: View, side: Any) -> None:
+    """`/btw <question>`: to the side chat, or -- with side questions off -- the reason
+    it was not asked, so the question is not silently dropped."""
+    if side is None:
+        view.status([SIDE_OFF])
+        return
+    side.ask(command.text)
+
+
+def _deliver_forward(loop: Any, reader: Any, words: str, note: str = "") -> None:
+    """What the side chat passes on (`send_to_agent`), to whichever part of the session
+    is listening for the person.
+
+    Mid-turn the loop takes it, and it rides with the next batch's results exactly as a
+    message typed then does (`Loop.forward`). With no turn running it goes where a
+    message typed now would go: back into the reader, as the person's own line, so the
+    prompt -- or the watch loop, during a solve -- reads it and starts a turn on it; the
+    side chat's note goes ahead of it as a harness note for that turn's first request
+    (`Loop.post`). Either way the agent reads the person's words, unchanged, and the
+    note labelled as the side chat's."""
+    if loop.forward(words, note):
+        return
+    loop.post(forwarded_note(note))
+    reader.putback(words)
+
+
+def _receipt(progress: Any) -> str:
+    """The line said the moment a message is typed while the agent is mid-turn.
+
+    Before, the front desk answered such a message with a cheaper model within seconds;
+    with it gone, this is what keeps the screen from going quiet: the message is queued,
+    when the agent will read it, what it is doing until then and for how long -- the
+    bar's own headline, clock included -- and how to ask something that cannot wait for
+    that. Facts the harness already has; no model call."""
+    doing = ""
+    if progress is not None:
+        try:
+            snap = progress.snapshot()
+            doing = snap.headline if snap.busy else ""
+        except Exception:  # noqa: BLE001 - the receipt is said either way
+            doing = ""
+    line = "queued: the agent reads this at its next step"
+    if doing:
+        line += f". Right now: {doing}"
+    return line + ". For a question answered without waiting, use /btw <question>."
+
+
 def _local(
     command: commands.Command,
     view: View,
@@ -2818,6 +3117,9 @@ def _local(
         _open_folder(store.dir, view)
     elif command.kind == commands.MODE:
         _switch_mode(command.text, view, loop)
+    elif command.kind == commands.ASIDE:
+        # Only reached with side questions off (`Approver` hands one here then).
+        view.status([SIDE_OFF])
     elif command.kind in (commands.YES, commands.NO, commands.ALL):
         # An answer with no question open: a question is answered inside the turn
         # that asked it (approval.Approver), so reaching here means nothing waits.
@@ -2841,15 +3143,17 @@ def _typed_while_working(
     store: Store,
     reader: Any,
     progress: Any = None,
-    concierge: Any = None,
+    side: Any = None,
 ) -> str | None:
     """Drain what was typed mid-turn, and hand back only what was meant for the model.
 
-    `/status` and `/files` are answered here and now, without a turn. Everything else
+    `/status` and `/files` are answered here and now, without a turn. A side question
+    (`/btw <question>`) goes to the side chat and never to the model. Everything else
     rides along with the next tool result, so it lands at the model's next turn rather
-    than sitting unread until the whole turn is over -- and, because "the next turn"
-    can be five minutes away when the agent is deep in a solve, the same text is handed
-    to the front desk, which answers within seconds without waiting on the main thread.
+    than sitting unread until the whole turn is over; a receipt says so at once, with
+    what the agent is doing meanwhile (`_receipt`), and a held wait ends within a second
+    for it (`Loop.heard`). Nothing answers it in the agent's place: the front desk that
+    used to, with a cheaper model and a slice of the transcript, is gone (`desk.py`).
     """
     for_model: list[str] = []
     while True:
@@ -2874,19 +3178,20 @@ def _typed_while_working(
             reader.putback(typed)
             _leave(loop)
             break
-        if command.kind in (commands.SAY, commands.ASIDE) and command.text:
+        if command.kind == commands.SAY and command.text:
             for_model.append(command.text)
-            if concierge is not None:
-                concierge.ask(command.text)
+            view.received(_receipt(progress))
+        elif command.kind == commands.ASIDE:
+            _ask_aside(command, view, side)
         elif command.kind == commands.MESH:
             # Not started here, and not dropped either. The agent holds the session's
             # one thread and may be inside a desk run of its own on the same kernel,
             # which is sequential -- so a second desk started from under it would
             # queue behind whatever is running and come back having done nothing.
-            # Saying so is the whole of the fix; `/btw` is the channel that works
-            # while something else is going.
+            # Saying so is the whole of the fix; a plain message is the channel that
+            # works while something else is going.
             view.warn("the agent is working; /mesh runs when the prompt is back. "
-                      "To say something now, use /btw")
+                      "A plain message reaches it at its next step")
         else:
             _local(command, view, browser, store, loop, progress)
     return "\n".join(for_model) or None
@@ -2934,7 +3239,7 @@ def _open_folder(path: Path, view: View) -> None:
     view.info(f"opened {path}")
 
 
-RETRYABLE_MODEL_STATUSES = frozenset({408, 409, 425, 429})
+RETRYABLE_MODEL_STATUSES = llm_base.TRANSIENT_STATUSES
 """Model-API failures worth waking the model on again: a timeout, a conflict, a
 rate limit. Everything else the API answers with a 4xx is about this account or
 this request -- the budget, the key, the model id -- and answers the same way in a
@@ -2978,28 +3283,52 @@ def _run_turn(loop: Loop, view: View) -> bool:
     status: int | None = None
     said = ""
     exc_message = ""
-    try:
-        loop.run()
-        loop.api_failures = 0
-        loop.blocked_reason = None
-        loop.images_dropped = False
-        return True
-    except ProviderError as exc:
-        loop.api_failures += 1
-        status = exc.status_code
-        exc_message = exc.message or ""
-        if status:
-            said = f"The model API returned {status}: {exc.message}"
-        else:
-            said = f"Could not reach the model API: {exc.message}"
-        console.print()
-        console.print(f"[red]{said}[/]")
-        # The terminal sees the console; a web page sees the view. A refused call
-        # that only reached the console looked, on the page, like an agent that
-        # had gone quiet -- for ten minutes, to a person typing "what's going on?".
-        view.notice(said)
-
-    loop.settle()
+    attempt = 0
+    while True:
+        try:
+            loop.run()
+            loop.api_failures = 0
+            loop.blocked_reason = None
+            loop.images_dropped = False
+            return True
+        except ProviderError as exc:
+            status = exc.status_code
+            exc_message = exc.message or ""
+            if status:
+                said = f"The model API returned {status}: {exc.message}"
+            else:
+                said = f"Could not reach the model API: {exc.message}"
+            delay = llm_base.retry_delay(exc, attempt)
+            console.print()
+            console.print(f"[red]{said}[/]")
+            # The terminal sees the console; a web page sees the view. A refused call
+            # that only reached the console looked, on the page, like an agent that
+            # had gone quiet -- for ten minutes, to a person typing "what's going on?".
+            view.notice(said)
+        # The thread is answered up to where it stopped either way: a retry sends it
+        # again from there, and so does whatever comes after giving up.
+        loop.settle()
+        if delay is None:
+            break
+        # A rate limit, a timeout, a gateway: asked again here, after a wait, rather
+        # than ended. An ended turn is only resumed by something waking the loop --
+        # a person, a job finishing -- and on 2026-10-19 five studies had neither:
+        # each met foamd's limiter with nothing running, read "your turn" with
+        # nothing said, and stayed that way (`llm_base.TRANSIENT_WAITS`).
+        attempt += 1
+        waits = len(llm_base.TRANSIENT_WAITS)
+        console.print(f"[yellow]Trying again in {delay:g} s ({attempt} of {waits}).[/]")
+        # The agent's move, still: a page shows it working, and an MCP caller polling
+        # the study is not told the turn is over while it is only waiting to be retried.
+        view.working(f"model API busy - trying again in {delay:g} s ({attempt} of {waits})")
+        if llm_base.nap(delay, lambda: _spoke_or_left(loop)):
+            continue
+        if getattr(loop, "leaving", False):
+            break  # the person ended the session during the wait
+        # They said something: it goes in the thread, and the request goes now -- a
+        # person speaking is as good a moment to try again as any timer.
+        loop.take_typed()
+    loop.api_failures += 1
 
     # A 400 about an image is the one refusal this process can repair, because the
     # thing the API objected to is in a thread this process owns. Take the pictures
@@ -3016,6 +3345,12 @@ def _run_turn(loop: Loop, view: View) -> bool:
             )
             view.notice("an image was refused; it was dropped and the turn retried")
             return _run_turn(loop, view)
+
+    # Said in the transcript too, not only on the view. A notice is live-only: the web
+    # page drops it on a reload, and a page opened afterwards never had it. The turn
+    # that met the Bedrock 400 (`desk.py`) ended with an empty assistant row and nothing
+    # else in the record, so the study read as an agent that stopped talking.
+    _record_failure(loop, said)
 
     refused = bool(status) and 400 <= status < 500 and status not in RETRYABLE_MODEL_STATUSES
     study = loop.store.session.study_id
@@ -3045,6 +3380,31 @@ def _run_turn(loop: Loop, view: View) -> bool:
     return False
 
 
+def _spoke_or_left(loop: Any) -> bool:
+    """Whether a wait between retries should end: the person said something, or ended
+    the session. Asked the way a held tool wait asks (`Loop.heard`, `Loop.leaving`):
+    the drain answers commands on the spot and keeps words for the model."""
+    heard = getattr(loop, "heard", None)
+    return bool(heard is not None and heard()) or bool(getattr(loop, "leaving", False))
+
+
+FAILED_TURN = "The model request failed, so this turn ended: {said}"
+"""The transcript's record of a turn a model-API failure ended (`_run_turn`)."""
+
+
+def _record_failure(loop: Any, said: str) -> None:
+    """Put a failed request in the transcript as an event the person can see.
+
+    Never raises: the session is already handling one failure."""
+    event = getattr(loop, "event", None)
+    if event is None:
+        return
+    try:
+        event(FAILED_TURN.format(said=said))
+    except Exception:  # noqa: BLE001 - see docstring
+        pass
+
+
 def _run_interactive(
     loop: Loop,
     backend: Backend,
@@ -3054,7 +3414,7 @@ def _run_interactive(
     reader: Any,
     live: LiveMirror | None = None,
     progress: Any = None,
-    concierge: Any = None,
+    side: Any = None,
     cad: Any = None,
 ) -> None:
     while True:
@@ -3084,15 +3444,11 @@ def _run_interactive(
                 # the failure again. Either way, try.
                 loop.blocked_reason = None
                 # A long solve is exactly when someone wants to leave, or to ask what
-                # is happening without setting the whole thing off again. The desk
-                # answers the question now; the model still hears it at the next wake.
-                if concierge is not None and commands.parse(wake.text).kind in (
-                    commands.SAY, commands.ASIDE
-                ):
-                    concierge.ask(commands.parse(wake.text).text)
+                # is happening without setting the whole thing off again: `/status`
+                # and `/btw <question>` are answered without a turn (`_apply`).
                 spoken = _apply(
                     commands.parse(wake.text), loop, view, browser, store, progress,
-                    cad=cad, backend=backend,
+                    cad=cad, backend=backend, side=side,
                 )
                 if spoken is QUIT:
                     return
@@ -3100,7 +3456,6 @@ def _run_interactive(
                     continue
             else:
                 continue
-            from_prompt = False
         else:
             if progress is not None:
                 progress.begin("waiting")
@@ -3112,7 +3467,7 @@ def _run_interactive(
             loop.blocked_reason = None
             with _timed("idle.apply"):
                 spoken = _apply(commands.parse(line), loop, view, browser, store, progress,
-                                cad=cad, backend=backend)
+                                cad=cad, backend=backend, side=side)
             if spoken is QUIT:
                 return
             if spoken is None:
@@ -3122,9 +3477,12 @@ def _run_interactive(
                     # go ahead from the next message.
                     loop.refresh(_with_mode(situation(store, backend), loop))
                 continue
-            from_prompt = True
 
         completed = _run_turn(loop, view)
+        for words, note in _take_forwarded(loop):
+            # The side chat passed something on after this turn's last drain: it waits
+            # at the prompt as the person's next line, as if they had typed it now.
+            _deliver_forward(loop, reader, words, note)
         if getattr(loop, "leaving", False):
             # The person ended the session while that turn ran, and the loop stopped
             # it at its next safe point (`Loop.leave`). What follows is what a
@@ -3132,19 +3490,15 @@ def _run_interactive(
             # the final sync, the capture, `_close_down`. The `/exit` itself is still
             # in the reader, put back by the drain; nobody needs to read it now.
             return
-        # If a turn typed at the prompt failed, the desk still answers -- the reason
-        # someone asks "are you still working?" is usually that the agent went quiet,
-        # and a failing turn is exactly that. (Mid-solve messages already reach the
-        # desk above; this covers the idle prompt, which did not.)
-        if not completed and from_prompt and concierge is not None and isinstance(spoken, str):
-            concierge.ask(spoken)
         # After the turn rather than before it: whatever the agent just made is the
         # thing worth having, and a turn that failed still leaves whatever its jobs
         # wrote. Unchanged files are not asked for again, so this is cheap -- and it
         # is asked for, not waited for: the next thing this thread does is read what
         # the user typed, and a sync that takes twenty minutes must not stand in
         # front of that (see LiveMirror.catch_up).
-        if live is not None:
+        if _no_workspace_yet(loop):
+            pass  # the solver is still to be chosen: there is nothing to mirror
+        elif live is not None:
             live.catch_up()
         else:
             _mirror(browser, view)
@@ -3181,7 +3535,7 @@ def _run_one_shot(
     loop.say(prompt)
     if not _run_turn(loop, view):
         return "failed"
-    if live is not None:
+    if live is not None and not _no_workspace_yet(loop):
         live.catch_up()
 
     deadline = time.monotonic() + max_wait_minutes * 60 if max_wait_minutes else None
@@ -3200,30 +3554,113 @@ def _run_one_shot(
         loop.inform(wake.text)
         if not _run_turn(loop, view):
             return "failed"
-        if live is not None:
+        if live is not None and not _no_workspace_yet(loop):
             live.catch_up()
         if loop.needs_refresh:
             loop.refresh(_with_mode(situation(store, backend), loop))
     return "ok"
 
 
-def _sync_toolbox(backend: Backend) -> None:
-    """Push the toolbox into the workspace. It is offered, never imposed."""
+def _take_forwarded(loop: Any) -> list[tuple[str, str]]:
+    """`Loop.take_forwarded`, for the stand-in loops that have none."""
+    take = getattr(loop, "take_forwarded", None)
+    return take() if take is not None else []
+
+
+def _no_workspace_yet(loop: Any) -> bool:
+    """Whether the study's solver is still open -- no first message has been routed
+    (`desk.route`) -- so that no workspace exists and a sync would wait on one that
+    nobody has started."""
+    return getattr(getattr(loop, "ctx", None), "solver", None) == solvers.AUTO
+
+
+def _sync_toolbox(backend: Backend, solver: str = solvers.OPENFOAM) -> None:
+    """Push the toolbox into the workspace. It is offered, never imposed.
+
+    Each solver gets its own part of it (`_toolbox_for`): a Felix study the Felix
+    scripts, an OpenFOAM study everything else, each with an index naming only what
+    it was given."""
     if not TOOLBOX_SOURCE.is_dir():
         return
     try:
-        backend.put_tree(TOOLBOX_SOURCE, TOOLBOX_DEST)
+        backend.put_tree(_toolbox_for(solver), TOOLBOX_DEST)
     except BackendError as exc:
         console.print(f"[yellow]toolbox sync skipped:[/] {exc}")
 
 
-def _sync_toolbox_timed(backend: Backend) -> None:
+FELIX_TOOLBOX_PREFIX = "felix_"
+"""The toolbox's Felix scripts are named for it (`felix_results.py`); every other file
+in it is OpenFOAM know-how -- case generators, templates, field notes."""
+
+_TOOLBOX_ROW = re.compile(r"^\| `([^`]+)` \|")
+_staged_toolboxes: dict[str, Path] = {}
+_staging_lock = threading.Lock()
+
+
+def _toolbox_for(solver: str) -> Path:
+    """The toolbox as one solver's study gets it, staged once per process.
+
+    The scripts are split by name (`FELIX_TOOLBOX_PREFIX`), and so are the rows of the
+    index, `README.md`, which is what the agent reads to find them: an OpenFOAM study
+    is not told about a Felix script, nor a Felix study about OpenFOAM's. The Felix
+    index keeps the index's opening and its own rows, and leaves out the paragraphs
+    after the table, which are about OpenFOAM's environment, templates and notes."""
+    import atexit
+    import shutil
+    import tempfile
+
+    felix = solver == solvers.FELIX
+    key = solvers.FELIX if felix else solvers.OPENFOAM
+    with _staging_lock:
+        staged = _staged_toolboxes.get(key)
+        if staged is not None and staged.is_dir():
+            return staged
+        root = Path(tempfile.mkdtemp(prefix=f"openreynolds-toolbox-{key}-"))
+        atexit.register(shutil.rmtree, root, True)
+        staged = root / "toolbox"
+
+        def is_felix(name: str) -> bool:
+            return name.startswith(FELIX_TOOLBOX_PREFIX)
+
+        if felix:
+            staged.mkdir()
+            for item in sorted(TOOLBOX_SOURCE.iterdir()):
+                if item.is_file() and is_felix(item.name):
+                    shutil.copy2(item, staged / item.name)
+        else:
+            shutil.copytree(
+                TOOLBOX_SOURCE, staged,
+                ignore=lambda folder, names: [
+                    n for n in names
+                    if n == "__pycache__" or (Path(folder) == TOOLBOX_SOURCE and is_felix(n))
+                ],
+            )
+        readme = TOOLBOX_SOURCE / "README.md"
+        if readme.is_file():
+            kept: list[str] = []
+            table_seen = False
+            for line in readme.read_text(encoding="utf-8").splitlines():
+                row = _TOOLBOX_ROW.match(line)
+                if row:
+                    table_seen = True
+                    if is_felix(Path(row.group(1)).name) == felix:
+                        kept.append(line)
+                    continue
+                if felix and table_seen:
+                    break  # past the table: OpenFOAM's environment, templates, notes
+                kept.append(line)
+            (staged / "README.md").write_text("\n".join(kept) + "\n", encoding="utf-8")
+        _staged_toolboxes[key] = staged
+        return staged
+
+
+def _sync_toolbox_timed(backend: Backend, solver: str = solvers.OPENFOAM) -> None:
     """`_sync_toolbox` under its stopwatch, for the background thread `session` runs
     it on. Never raises: a toolbox that could not be pushed is reported by
     `_sync_toolbox` itself, and the session goes on without it."""
     try:
         with _timed("sync_toolbox"):
-            _sync_toolbox(backend)
+            _sync_toolbox(backend, solver)
     except Exception as exc:  # noqa: BLE001 - see docstring
         console.print(f"[yellow]toolbox sync skipped:[/] {exc}")
 

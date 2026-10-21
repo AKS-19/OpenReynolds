@@ -199,7 +199,10 @@ def test_full_auto_with_a_one_shot_run_goes_ahead(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENREYNOLDS_MODE", raising=False)
     acquired, _ = _no_instance(monkeypatch, tmp_path)
 
-    result = CliRunner().invoke(cli.main, ["-p", "go", "--mode", "full"])
+    # With the solver given, the workspace is reserved at the start, so reaching the
+    # (failing) reserve is the proof the run went past the mode check. Left to the
+    # agent (`--solver auto`, the default) nothing is reserved until it has chosen.
+    result = CliRunner().invoke(cli.main, ["-p", "go", "--mode", "full", "--solver", "openfoam"])
 
     assert result.exit_code == 1  # the fake service is down, which is past the check
     assert acquired
@@ -319,9 +322,38 @@ def test_a_switch_typed_mid_turn_rides_with_the_tool_results(loop, backend, stor
                            if m["role"] == "user" and isinstance(m["content"], list))
     assert results_message["content"][0]["type"] == "tool_result"
     assert any("structured mode" in t for t in texts_in_results(loop))
-    names = [t["name"] for t in fake.calls[-1]["tools"]]
-    assert "checkpoint" in names, "the tool list follows the switch at the next request"
-    assert "checkpoint" not in [t["name"] for t in fake.calls[0]["tools"]]
+    assert fake.calls[-1]["tools"] == fake.calls[0]["tools"], (
+        "the switch is a note in the thread; the tool list does not move")
+
+
+@pytest.mark.parametrize("modes_in_order", [
+    ("structured", "auto"),
+    ("partial", "structured", "partial"),
+    ("auto", "structured", "auto", "partial"),
+])
+def test_switching_mode_never_changes_the_prompt_or_the_tools(
+    loop, backend, store, view, modes_in_order
+):
+    """The invariant `/mode` used to break: every request of one conversation carries
+    the same system prompt and the same tool list, whatever the person switches to and
+    from mid-turn. What a switch changes reaches the model as a harness note."""
+    responses = []
+    for i, _ in enumerate(modes_in_order):
+        responses.append(message([tool_block("read_file", {"path": "/work"}, f"tu_{i}")],
+                                 stop_reason="tool_use"))
+    responses.append(message([text_block("done")]))
+    fake = install_model(loop, responses)
+    backend.dirs["/work"] = ["case"]
+    switches = iter(modes_in_order)
+    loop.interject = lambda: (loop.set_mode(next(switches, loop.ctx.mode)) and None)
+    loop.say("go")
+    loop.run()
+
+    assert len(fake.calls) == len(modes_in_order) + 1
+    assert all(call["system"] == fake.calls[0]["system"] for call in fake.calls)
+    assert all(call["tools"] == fake.calls[0]["tools"] for call in fake.calls)
+    said = "\n".join(texts_in_results(loop))
+    assert "switched this session" in said
 
 
 # -- the gate in the loop --------------------------------------------------------

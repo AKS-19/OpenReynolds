@@ -252,3 +252,23 @@ def test_a_partial_session_waits_for_yes_before_starting_the_job(ctx, store, bac
     assert [q[1] for q in view.questions] == ["job"]
     assert view.answers[0][1] == "approved"
     assert [s["cmd"] for s in backend.started] == ["simpleFoam"]
+
+
+def test_a_side_question_while_a_question_is_open_leaves_it_open():
+    """A side question is by definition not an answer to anything in the conversation:
+    it goes to the side chat, and the question waits for a real answer."""
+    asked = []
+    view = AskingView()
+    reader = ScriptedReader(["/btw how much will this cost?", "/yes"])
+
+    decision = Approver(view, reader, side=asked.append).ask("job", "Start a job: solve", "cmd: x")
+
+    assert asked == ["how much will this cost?"]
+    assert decision.approved
+
+
+def test_a_side_question_with_side_questions_off_still_leaves_it_open():
+    said = []
+    decision, _, _ = ask(["/btw how much?", "/no"], local=said.append)
+    assert [c.kind for c in said] == [commands.ASIDE]
+    assert not decision.approved and decision.note == ""

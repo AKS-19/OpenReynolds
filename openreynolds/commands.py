@@ -1,11 +1,12 @@
 """What the user can type that is not a message.
 
 These are the user's own words about how they want to be heard, not the harness's
-opinion about how the model should work. `/btw` marks a message as an aside because
-the user chose to mark it; `/status` is answered here and never reaches the model at
-all, which is the only way to ask "what is going on" without becoming a turn. `/mode`,
-`/model` and `/effort` are the same kind of thing: the person saying how they want the
-session run, answered by the harness.
+opinion about how the model should work. `/btw <question>` is a side question because
+the user chose to ask one: answered apart from the conversation (`desk.SideChat`) and
+never added to it, while the agent carries on. `/status` is answered here and never
+reaches the model at all, which is the only way to ask "what is going on" without
+becoming a turn. `/mode`, `/model` and `/effort` are the same kind of thing: the person
+saying how they want the session run, answered by the harness.
 
 Nothing here inspects, rewrites or withholds an ordinary message.
 
@@ -72,11 +73,14 @@ COMMANDS: tuple[Spec, ...] = (
          "Your words go to the CAD desk as the request, past the main agent, which "
          "hears about it when the desk reports. Name a file with @ to hand it over: "
          "/mesh prepare @/work/uploads/part.step."),
-    Spec("/btw", ("/bytheway", "/aside"), ASIDE, "<something>",
-         "say it without asking the agent to stop what it is doing",
-         "Your words reach the agent at its next step, marked as an aside, so it can "
-         "take them into account without abandoning the command it is running. On its "
-         "own, /btw is the same as /status."),
+    Spec("/btw", ("/bytheway", "/aside"), ASIDE, "<question>",
+         "a side question, answered now without interrupting the agent",
+         "Answered from the agent's own context, apart from the conversation: nothing "
+         "about it is added to the agent's thread, and the agent carries on with what it "
+         "is doing. The side answer can read files and a job's log, and can pass your "
+         "words on to the agent when you ask for something to be done; it cannot stop "
+         "or approve anything. A plain message is how to tell the agent something. On "
+         "its own, /btw is the same as /status."),
     Spec("/status", ("/what",), STATUS, "",
          "what is happening right now, answered here; the agent is not told",
          "Jobs running, the thread size, tokens sent and how much came from the cache, "
@@ -120,7 +124,8 @@ COMMANDS: tuple[Spec, ...] = (
          "The call does not run and the agent is told you declined it, with your reason "
          "in your words. While a question is open, anything you type that is not a yes "
          "(y, yes, ok, go), a no (n, no), an all (a, all) or a command answered here "
-         "(/status, /files, /renders, /open, /help, /mode, /model, /effort) also "
+         "(/status, /files, /renders, /open, /help, /mode, /model, /effort) or a "
+         "side question (/btw <question>, which leaves the question open) also "
          "declines, and what you typed is the reason. /exit declines and leaves."),
     Spec("/all", (), ALL, "",
          "approve this and everything after it (switches the session to auto)",
@@ -153,7 +158,8 @@ TOPICS: tuple[tuple[str, str], ...] = (
 class Command:
     kind: str
     text: str = ""
-    """For `say` and `aside`, what goes to the model. For `files`, the path asked for;
+    """For `say`, what goes to the model; for `aside`, the side question, as typed. For
+    `files`, the path asked for;
     for `mode`, `model`, `effort` and `help`, the argument; for `no`, the reason."""
     inputs: tuple[str, ...] = ()
     """The files the line handed over with `@`, in the order they were typed.
@@ -186,8 +192,6 @@ def parse(line: str) -> Command:
         return Command(STATUS)
     if kind in (ASIDE, SAY, MESH):
         spoken, handed = handovers(rest)
-        if kind is ASIDE:
-            return Command(ASIDE, aside(spoken), handed)
         return Command(kind, spoken, handed)
     if kind is YES and rest.lower() == "all":
         return Command(ALL)
@@ -234,15 +238,6 @@ def handovers(text: str) -> tuple[str, tuple[str, ...]]:
 
     spoken = _HANDOVER.sub(take, text).strip()
     return spoken, tuple(handed)
-
-
-def aside(text: str) -> str:
-    """The user's framing, in the user's voice.
-
-    They typed `/btw`; this is what that meant. It is a statement of what they want,
-    not an instruction about how to work -- what to do about it stays the model's call.
-    """
-    return f"By the way, no need to stop what you are doing: {text}"
 
 
 # -- help ----------------------------------------------------------------------
@@ -313,8 +308,8 @@ def _modes_topic() -> list[str]:
         "spends compute. bash, read_file, write_file, fetch, job_check, job_kill and "
         "cad run freely. Answer /yes, /no <reason> or /all (approve and switch to "
         "auto for the rest of the session).",
-        "structured gives the agent a checkpoint tool. Each checkpoint shows you a "
-        "summary and what comes next, and waits for your answer: /yes carries on, "
+        "structured makes the agent's checkpoint tool put its questions to you. Each "
+        "checkpoint shows you a summary and what comes next, and waits for your answer: /yes carries on, "
         "anything else goes back as the changes you want. job_start is held until you "
         "have approved a first checkpoint, the plan.",
     ]
@@ -377,12 +372,14 @@ TOOL_HELP: tuple[tuple[str, str], ...] = (
                     "it changes nothing and runs no checkMesh"),
     ("checkpoint", "structured mode only: shows you a stage summary and what comes next, "
                    "and waits for your answer"),
+    ("send_to_agent", "used only by a side question (/btw): passes your words on to the "
+                      "agent at its next step; the agent itself never needs it"),
 )
 
 
 def _tools_topic() -> list[str]:
     lines = ["the tools the agent works with:"]
-    lines += [f"  {name.ljust(12)}{text}" for name, text in TOOL_HELP]
+    lines += [f"  {name.ljust(14)}{text}" for name, text in TOOL_HELP]
     lines.append("Everything else, OpenFOAM included, is done through bash on the workspace.")
     return lines
 

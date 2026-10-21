@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .. import images
-from ..llm import Listener, ProviderError, make_provider
+from ..llm import Listener, ProviderError, endpoint_key, make_provider
 from .brief import (CAD_DONE, CAD_REFUSED, remark_message, system_prompt,
                     task_message)
 from .cells import Cell, CellLog
@@ -451,8 +451,10 @@ class CadDesk:
         The same callable the main loop uses between its own tool calls. Held here as
         well because this desk holds the thread for minutes at a time, and a remark
         that waits that long is a remark that arrives after the thing it was about."""
-        self.provider = make_provider(cfg)
         self.model = cfg.mesher_model or cfg.model
+        self.provider = make_provider(cfg, model=self.model)
+        self._built_for = (self.model, endpoint_key(cfg, self.model))
+        """The configured model and the endpoint `provider` was built for; see `_follow`."""
         self.effort = cfg.mesher_effort or "high"
         self.max_steps = int(cfg.mesher_max_steps or MAX_STEPS)
         self.max_seconds = float(cfg.mesher_max_seconds or MAX_SECONDS)
@@ -474,8 +476,26 @@ class CadDesk:
 
     # -- the run ---------------------------------------------------------------
 
+    def _follow(self) -> None:
+        """Pick up a mid-study `/model` that moved the desk's model or its endpoint.
+
+        The desk builds with the main model unless one is named for it, and the config
+        is the session's own object, so a `/model` lands here at the next run. On
+        `reynolds` that can be the other family, whose API this client does not speak,
+        so the client is rebuilt whenever the provider, key, endpoint or family moved.
+        Nothing moved, nothing is touched."""
+        model = self.cfg.mesher_model or self.cfg.model
+        built = (model, endpoint_key(self.cfg, model))
+        if built == self._built_for:
+            return
+        self.model = model
+        if built[1] != self._built_for[1]:
+            self.provider = make_provider(self.cfg, model=model)
+        self._built_for = built
+
     def run(self, request: str, case: str | None = None,
             geometry: str = "", inputs: Sequence[str] = ()) -> CadResult:
+        self._follow()
         case_rel = _case_name(case)
         case_dir = f"{self.home}/{case_rel}"
         self.case_dir = case_dir
@@ -1518,6 +1538,14 @@ def _answer(messages: list[dict[str, Any]], ids: list[str], content: Any,
         text = content if isinstance(content, str) else str(content)
         _observe(messages, "\n\n".join(t for t in (text, note) if (t or "").strip()))
         return
+    # An error result may hold text only -- the API refuses the whole request
+    # otherwise ("all content must be type `text` if `is_error` is true"), which ended
+    # a run the first time a failing cell had also drawn something. The pictures still
+    # go back, just beside the result instead of inside it.
+    beside: list[dict[str, Any]] = []
+    if is_error and isinstance(content, list):
+        beside = [b for b in content if b.get("type") != "text"]
+        content = [b for b in content if b.get("type") == "text"]
     blocks: list[dict[str, Any]] = [{
         "type": "tool_result",
         "tool_use_id": ids[0],
@@ -1529,6 +1557,7 @@ def _answer(messages: list[dict[str, Any]], ids: list[str], content: Any,
             "type": "tool_result", "tool_use_id": extra, "is_error": True,
             "content": "This call did not run: one cell per message.",
         })
+    blocks.extend(beside)
     if note:
         blocks.append({"type": "text", "text": note})
     messages.append({"role": "user", "content": blocks})

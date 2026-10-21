@@ -19,10 +19,21 @@ and says whether it is the shape that was asked for. It is a second opinion abou
 one somebody uploaded -- and it changes nothing. Like `cad`, it is in the list only when
 there is a reviewer to serve it.
 
-A tenth, `checkpoint`, exists only when the person chose structured mode (`modes.py`):
-it puts a summary in front of them and waits for their answer. It is the person asking
-to be consulted, not the harness deciding to consult them, so in full auto it is not in
-the list at all.
+A tenth, `checkpoint`, is structured mode's (`modes.py`): there it puts a summary in
+front of the person and waits for their answer, the person asking to be consulted
+rather than the harness deciding to. It is in the list in every mode, because the list
+may not change mid-conversation, and outside structured mode it answers that
+checkpoints are structured mode's and puts nothing to anyone.
+
+`send_to_agent` is in every list and is not the main agent's at all. It is the side
+chat's (`desk.SideChat`): a `/btw` question is answered by the main agent's own last
+request sent again with the question appended, and that request reads the whole
+conversation from the prompt cache only if its tool list is this one, byte for byte. So
+the one tool the side chat needs of its own -- passing the person's words on -- is here
+from the first request of every session to the last, and called by the main agent it
+answers that it is for side questions. One short definition in a cached prefix costs a
+few hundred cache-read tokens a request; a tool list that differed between the two
+requests would cost the whole conversation at the uncached rate on every side question.
 """
 
 from __future__ import annotations
@@ -35,8 +46,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import convergence, images
-from . import trace
-from .progress import case_dir_from_cmd, parse_control_dict, phase_from_cmd
+from . import solvers, trace
+from .progress import (
+    case_dir_from_cmd,
+    felix_job_summary,
+    is_felix_solve,
+    parse_control_dict,
+    phase_from_cmd,
+)
 from .backend.base import (
     Backend,
     BackendError,
@@ -55,6 +72,10 @@ JOB_WAIT_MAX_S = 300
 
 JOB_WAIT_POLL_S = 5.0
 """How often a waiting `job_check` looks at the job."""
+
+INPUT_POLL_S = 1.0
+"""How often a held wait asks whether the person has written or left (`_hold`). A
+message typed while the agent waits is read within this, not within `JOB_WAIT_POLL_S`."""
 
 READ_TIMEOUT_S = 60.0
 """How long `read_file` waits on the workspace for one file before saying so.
@@ -168,6 +189,13 @@ class ToolContext:
     on_mode: Callable[[str], None] | None = None
     """Switches the session's mode (`Loop.set_mode`), for a checkpoint answered with
     "approve all"."""
+    solver: str = solvers.OPENFOAM
+    """This study's solver (`solvers.py`): `openfoam` or `felix`. It decides the tool
+    list (`tools_for`), how `job_start` reads a launch, and the system prompt the loop
+    sends. Set once, before the first request: by the session for a study whose solver
+    is known, and for one left to choose (`auto`) by the routing request that reads the
+    person's first message (`desk.route`) -- never by the model in this conversation,
+    because a session's system prompt and tool list do not change under it."""
 
 
 def tools_for(ctx: ToolContext) -> list[dict[str, Any]]:
@@ -181,23 +209,39 @@ def tools_for(ctx: ToolContext) -> list[dict[str, Any]]:
     sub-agent beats the bash the caller already has. With both wired the list is
     `TOOLS` itself, the same object every call, so the cache prefix does not move.
 
-    `checkpoint` is the other: it is offered only in structured mode. A `/mode` switch
-    into or out of structured therefore changes the tool list once, which rewrites the
-    prompt cache from position 0 once; that is the price of the person's choice and it
-    is paid only when they make it. Sorted by name either way, so the list for a given
-    mode is always the same bytes.
+    Neither of those can change during a session: the desk and the reviewer are built
+    once, before the first request, and the solver is fixed. Nothing else is
+    conditional. `checkpoint` used to be -- offered only in structured mode, so a
+    `/mode` switch into or out of it changed the tool list mid-conversation, which
+    rewrote the prompt cache from position 0 and, worse, invalidated every thinking
+    block in the thread: a thinking block is bound to the system prompt, the tool
+    list and the messages before it, and a provider that checks the binding (Bedrock,
+    or Anthropic's API with `prefix_mismatch_behavior: "error"`) refuses the next
+    request with a 400. It is now in every list, in every mode, and answers outside
+    structured mode that checkpoints are structured mode's (`_checkpoint`); the mode
+    itself reaches the model as a harness note (`Loop.set_mode`).
     """
     withheld = set()
     if ctx.cad is None:
         withheld.add("cad")
     if ctx.reviewer is None:
         withheld.add("mesh_review")
-    offered = TOOLS if not withheld else [
-        tool for tool in TOOLS if tool["name"] not in withheld
-    ]
-    if ctx.mode != "structured":
-        return offered
-    return sorted([*offered, CHECKPOINT_TOOL], key=lambda tool: tool["name"])
+    solver = getattr(ctx, "solver", solvers.OPENFOAM)
+    # No `auto` branch. A study still choosing used to be offered `choose_solver`
+    # alone and then, mid-conversation, the chosen solver's prompt and tools -- and a
+    # thinking block's signature is bound to the system prompt and the tool list it
+    # was made under, so the request after the swap was a 400 on Bedrock ("The block
+    # is bound to a different conversation ... The `system` prompt and the `tools`
+    # list both differ"), and the turn ended with nothing said. The solver is now
+    # settled before the first request (`desk.route`), so the list is the solver's
+    # from turn one; `auto` is never asked for here, and is OpenFOAM's if it were.
+    if solver == solvers.FELIX:
+        offered = FELIX_TOOLS
+    else:
+        offered = TOOLS if not withheld else [
+            tool for tool in TOOLS if tool["name"] not in withheld
+        ]
+    return offered
 
 
 FRESH_SHELL = (
@@ -511,6 +555,31 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "send_to_agent",
+        "description": (
+            "For a side question only (the harness says, in the message, when one is "
+            "being asked). Passes what the person asked in that side question on to the "
+            "work in progress, in their own words, at its next step -- the way a message "
+            "they type reaches it -- with an optional short note of yours, labelled as "
+            "yours. Use it when they asked for something to be done, changed or "
+            "considered, rather than only for information. Outside a side question it "
+            "sends nothing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": (
+                        "Optional, one or two sentences: context the side answer found "
+                        "that the work in progress would want beside the person's words. "
+                        "Not a rewrite of what they said; their words go as they are."
+                    ),
+                },
+            },
+        },
+    },
+    {
         "name": "write_file",
         "description": "Write text to a path in the workspace. Parent directories are created.",
         "input_schema": {
@@ -524,16 +593,100 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
+
+
+FELIX_FRESH_SHELL = (
+    "Each call runs in a fresh shell: `cwd` carries between calls, nothing else does "
+    "-- variables you export, files you source and shell options are gone by the next "
+    "one."
+)
+"""`FRESH_SHELL` for a Felix workspace, which has no OpenFOAM environment to load."""
+
+FELIX_ONLY = frozenset({"cad", "mesh_review"})
+"""Withheld from a Felix study: the CAD desk and the reviewer build and judge OpenFOAM
+meshes, and a Felix case needs a tagged `.vtu`."""
+
+
+def _felix_variant(tool: dict[str, Any]) -> dict[str, Any]:
+    """One of `TOOLS` as a Felix study is offered it."""
+    if tool["name"] == "bash":
+        return {**tool, "description": tool["description"].replace(
+            FRESH_SHELL, FELIX_FRESH_SHELL)}
+    if tool["name"] == "job_start":
+        return FELIX_JOB_START
+    return tool
+
+
+FELIX_JOB_START: dict[str, Any] = {
+    "name": "job_start",
+    "description": (
+        "Start a long command detached and return a job id immediately. The job "
+        "keeps running after your turn ends, and after this session closes. "
+        f"{FELIX_FRESH_SHELL} "
+        "Do not redirect stdout or stderr to a file: the detached job already "
+        "captures both, and `job_check` can only stream what the job captures. "
+        "Commands that pipe into `tee` or use `>`, `>>`, `2>&1` are refused. "
+        "A solve is `felix run <case> --gpu G [--wall S]`: it uploads the case, runs "
+        "it on one cloud GPU of type G (`felix gpus` lists them as JSON with "
+        "`usd_per_hour`), billed per second while it runs. This job's log is its "
+        "stderr: a `NOTE:` naming the solve, then the solver's lines as they are "
+        "written -- `ERROR:`, `WARNING:` and `NOTE:` lines and one `step=` record per "
+        "step. The results come back into `<case>/output/` (an earlier `output/` is "
+        "moved to `output.previous/`), and stdout is the solve's final status as JSON "
+        "(`state`, `gpu`, `billed_s`, `cost_usd`, `exit_code`, `error`). Exit 0: the "
+        "solve succeeded; 1: it failed, was killed, or was refused by the service "
+        "(one `ERROR:` line with the status, e.g. `402 budget_exhausted`); 2: refused "
+        "here before anything was sent, with one `ERROR:` line -- a case whose "
+        "`output.every` is 0 or unset (a solve writes snapshots so that it can be "
+        "continued), one missing `case.yaml` or its mesh, or one holding a symlink. "
+        "`--wall` caps the solve's wall time in seconds. `felix continue <case> --gpu "
+        "G [--wall S]` points `io.yaml`'s `warm_start` at the newest snapshot and sets "
+        "`nsteps` to the steps that remain, in place, and submits that. `job_kill` "
+        "stops a solve on its GPU too, and what it wrote so far still comes back."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "cmd": {"type": "string"},
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Directory to run in. Defaults to this study's own "
+                    "directory, which your briefing names."
+                ),
+            },
+            "name": {"type": "string", "description": "A label for your own reference."},
+            "kill_on": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Regexes matched against log lines. The first match terminates "
+                    "the job and the matching line is reported back. Optional."
+                ),
+            },
+        },
+        "required": ["cmd"],
+    },
+}
+"""`job_start` in a Felix study: what `felix run` is, with none of the OpenFOAM
+launch facts (ranks, collated files, the restart guard, the trapFpe banner) that
+`_job_start` does not apply to it."""
+
+FELIX_TOOLS: list[dict[str, Any]] = [
+    _felix_variant(tool) for tool in TOOLS if tool["name"] not in FELIX_ONLY
+]
+"""What a Felix study is offered, sorted by name like `TOOLS` and the same object every
+call, so the cache prefix does not move."""
 
 CHECKPOINT_TOOL: dict[str, Any] = {
     "name": "checkpoint",
     "description": (
         "Put where the study stands in front of the person and wait for their answer. "
-        "Offered because they chose structured mode: they want to agree a plan, and to "
-        "hear from you after each stage. The result says whether they approved, and "
-        "carries their words when they asked for changes. job_start calls are held "
-        "until a checkpoint has been approved in this mode."
+        "Only in structured mode, which the person chooses when they want to agree a "
+        "plan and hear from you after each stage; in any other mode nothing is put to "
+        "them and the result says so. The result says whether they approved, and "
+        "carries their words when they asked for changes. In structured mode job_start "
+        "calls are held until a checkpoint has been approved."
     ),
     "input_schema": {
         "type": "object",
@@ -558,8 +711,15 @@ CHECKPOINT_TOOL: dict[str, Any] = {
         "required": ["stage", "summary", "next"],
     },
 }
-"""Kept out of `TOOLS`: that list is what every mode offers, and this is structured
-mode's alone (`tools_for`)."""
+"""In every list, every mode (`tools_for`): a tool list that changed with `/mode` was a
+mid-conversation change to what the thread's thinking blocks are bound to."""
+
+for _offered in (TOOLS, FELIX_TOOLS):
+    # In place, so `TOOLS` and `FELIX_TOOLS` stay the objects `tools_for` hands back --
+    # the same object every request -- and stay sorted by name.
+    _offered.append(CHECKPOINT_TOOL)
+    _offered.sort(key=lambda tool: tool["name"])
+TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 
 ToolResult = str | list[dict[str, Any]]
@@ -886,6 +1046,20 @@ def _written_run_shape(args: dict[str, Any]) -> str:
     return f" [{', '.join(parts)}]"
 
 
+def _whole_file(args: dict[str, Any], size: int) -> bool:
+    """Whether a read asks for all of the file rather than a window of it.
+
+    No offset and no limit is the plain case. But `offset: 0` with a limit at least the
+    file's size is the same request spelled out, and a model that fills in every
+    optional argument (GPT does; Claude leaves them out) spells it out every time --
+    which read a 250 KB render as 48 KB of PNG bytes, and the model reported the plot
+    "not visually inspected". A window that starts later, or stops short, is still
+    asking for bytes."""
+    offset = int(args.get("offset") or 0)
+    limit = args.get("limit")
+    return offset == 0 and (not limit or int(limit) >= size)
+
+
 def _read_file(ctx: ToolContext, args: dict[str, Any]) -> str | list[dict[str, Any]]:
     path = args["path"]
     info = ctx.backend.stat(path, timeout=READ_TIMEOUT_S, max_attempts=READ_ATTEMPTS)
@@ -894,7 +1068,7 @@ def _read_file(ctx: ToolContext, args: dict[str, Any]) -> str | list[dict[str, A
         return f"{path} — directory, {len(info.entries)} entries\n\n{listing}"
 
     media = images.media_type(path)
-    if media is not None and not (args.get("offset") or args.get("limit")):
+    if media is not None and _whole_file(args, info.size):
         return _read_image(ctx, path, info, media)
 
     offset = max(0, int(args.get("offset") or 0))
@@ -1031,7 +1205,10 @@ def _stdio_redirected(cmd: str) -> bool:
 
 
 def _job_start(ctx: ToolContext, args: dict[str, Any]) -> str:
-    refusal = _restart_guard(ctx, args)
+    felix = getattr(ctx, "solver", solvers.OPENFOAM) == solvers.FELIX
+    # The restart guard, the trapFpe check and the launch notes read OpenFOAM cases
+    # (controlDict, time directories, a mesher's dictionaries); a Felix solve has none.
+    refusal = None if felix else _restart_guard(ctx, args)
     if refusal:
         return refusal
     cmd = args["cmd"]
@@ -1043,6 +1220,12 @@ def _job_start(ctx: ToolContext, args: dict[str, Any]) -> str:
         )
     trapfpe_banner = "trapFpe: Floating point exception trapping enabled"
     for pattern in args.get("kill_on") or []:
+        if felix:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                return f"not started: invalid kill_on regex {pattern!r}: {exc}"
+            continue
         try:
             matches_banner = re.search(pattern, trapfpe_banner)
         except re.error as exc:
@@ -1064,6 +1247,8 @@ def _job_start(ctx: ToolContext, args: dict[str, Any]) -> str:
     )
     _announce_jobs(ctx)
     label = f" ({args['name']})" if args.get("name") else ""
+    if felix:
+        return f"started job {job_id}{label}"
     return f"started job {job_id}{label}{_solve_shape(ctx, args)}{_mesher_note(ctx, args)}"
 
 
@@ -1408,6 +1593,11 @@ def _job_check(ctx: ToolContext, args: dict[str, Any]) -> str:
     if waited_note:
         header += " " + waited_note
     header += _running_on(ctx, record, status)
+    if record is not None:
+        felix = felix_job_summary(ctx.backend, record.cmd, record.cwd or ctx.home,
+                                  job_id, status.log_size)
+        if felix:
+            header += "\n" + "\n".join(felix)
     header += f"\nlog: bytes {offset}–{next_offset}, eof={eof}"
     if clipped:
         header += f" (this window clipped at {ctx.max_output} bytes; call again from {offset + len(body.encode('utf-8'))})"
@@ -1430,14 +1620,25 @@ def _hold(ctx: ToolContext, job_id: str, status: JobStatus,
     """
     began = time.monotonic()
     heard = left = False
+    looked = began
     while status.running and time.monotonic() - began < wait_s:
         heard = _heard(ctx)
         left = _leaving(ctx)
         if heard or left:
             break
+        # The person is asked after every `INPUT_POLL_S`, the job only every
+        # `JOB_WAIT_POLL_S`: asking the loop costs nothing but a queue read, and a
+        # status is a round trip to the workspace. They used to be asked together,
+        # every five seconds -- now that nothing answers a message for the agent while
+        # it waits (the front desk is gone, and `/btw` is a side question that never
+        # reaches this thread), the seconds between a message and the agent reading it
+        # are the whole of the reply time, and a second is the price of a queue read.
         remaining = wait_s - (time.monotonic() - began)
-        time.sleep(max(0.0, min(JOB_WAIT_POLL_S, remaining)))
-        status = ctx.backend.job_status(job_id)
+        until_look = JOB_WAIT_POLL_S - (time.monotonic() - looked)
+        time.sleep(max(0.0, min(INPUT_POLL_S, until_look, remaining)))
+        if time.monotonic() - looked >= JOB_WAIT_POLL_S:
+            status = ctx.backend.job_status(job_id)
+            looked = time.monotonic()
     return status, time.monotonic() - began, heard, left
 
 
@@ -1456,7 +1657,8 @@ def _running_on(ctx: ToolContext, record: Any, status: JobStatus) -> str:
     if not status.running or record is None:
         return ""
     cmd = getattr(record, "cmd", "") or ""
-    if phase_from_cmd(cmd)[0] != "solving":
+    if phase_from_cmd(cmd)[0] != "solving" or is_felix_solve(cmd):
+        # A Felix solve runs on a cloud GPU: the workspace's cores are not its cost.
         return ""
     load = _load_per_rank(ctx, cmd, case_dir_from_cmd(cmd, getattr(record, "cwd", "") or ctx.home))
     return f"\n{load}" if load else ""
@@ -1848,8 +2050,9 @@ def _checkpoint(ctx: ToolContext, args: dict[str, Any]) -> str:
     summary = str(args.get("summary") or "").strip()
     after = str(args.get("next") or "").strip()
     if ctx.mode != "structured":
-        return (f"The session is in {ctx.mode} mode, not structured mode, so this "
-                "checkpoint was not put to the person.")
+        return (f"Checkpoints apply only in structured mode, and this session is in "
+                f"{ctx.mode} mode, so nothing was put to the person. They can switch "
+                "with /mode structured.")
     if ctx.approver is None:
         return "Nobody is here to answer, so this checkpoint was not put to anyone."
     detail = summary + (f"\n\nnext: {after}" if after else "")
@@ -1868,6 +2071,20 @@ def _checkpoint(ctx: ToolContext, args: dict[str, Any]) -> str:
     return f"The person did not approve the {stage} checkpoint and gave no reason."
 
 
+def _send_to_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """`send_to_agent` called by the main agent itself, which has nobody to send to.
+
+    The tool exists for the side chat (`desk.SideChat`), which answers a `/btw` question
+    by sending the main agent's own last request again with one message appended. For
+    that request to read the main conversation from the prompt cache, its tool list has
+    to be the main one, byte for byte -- so the side chat's one tool of its own is in
+    the main list from the start of every session, and stays there. Here, called in
+    the main conversation, it is answered as what it is."""
+    del ctx, args
+    return ("send_to_agent is only for answering a side question (/btw), and none is "
+            "being asked: nothing was sent. You are the agent it would send to.")
+
+
 _HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], ToolResult]] = {
     "bash": _bash,
     "cad": _cad,
@@ -1878,6 +2095,7 @@ _HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], ToolResult]] = {
     "job_start": _job_start,
     "mesh_review": _mesh_review,
     "read_file": _read_file,
+    "send_to_agent": _send_to_agent,
     "write_file": _write_file,
 }
 

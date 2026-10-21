@@ -21,13 +21,15 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from .config import CONTEXT_REFRESH_FRACTION, CONTEXT_WINDOW_TOKENS
-from .llm import ProviderError, make_provider
+from .llm import ProviderError, endpoint_key, make_provider
 from .llm.presets import (
     EFFORTS,
     FALLBACK_CONTEXT_WINDOW,
     PRESETS,
     REYNOLDS,
     context_window_for,
+    desk_model_for,
+    family_for,
     models_for,
     preset_for,
 )
@@ -60,6 +62,9 @@ def status_lines(loop: Any) -> list[str]:
     known = models_for(cfg.provider)
     if known:
         lines.append("known models here: " + ", ".join(known))
+    chain = [m for m in getattr(getattr(loop, "provider", None), "fallbacks", ()) if m != cfg.model]
+    if chain:
+        lines.append("if the model declines a request, it is retried on: " + ", ".join(chain))
     pending = getattr(loop, "pending_model", None)
     if pending is not None:
         lines.append(f"switching to {pending.provider}:{pending.model} when the next turn starts")
@@ -131,11 +136,16 @@ def candidate(cfg: Any, provider: str, model: str, key: str) -> Any:
         # preset's model on a non-anthropic preset. That swap is for a provider named
         # on its own; a model named here is the opposite of that, and without this line
         # `/model claude-opus-5` on `reynolds` -- one of the two models that service
-        # meters -- quietly stayed on Sonnet, as did a resume restoring it. The model
-        # asked for wins, exactly as it does across providers below. Nothing about the
-        # desk was asked for, so it keeps the one the session already had.
+        # metered while it fronted Claude -- quietly stayed on Sonnet, as did a resume
+        # restoring it. The model asked for wins, exactly as it does across providers
+        # below. Nothing about the desk was asked for, so it keeps the one the session
+        # already had -- unless, on `reynolds`, the model moved to the other family: the
+        # desk speaks the main model's API, so it takes that family's desk model.
         new.model = model
         new.desk_model = cfg.desk_model
+        if (preset is not None and preset.name == REYNOLDS
+                and family_for(provider, model) != family_for(provider, cfg.model)):
+            new.desk_model = desk_model_for(provider, model)
         if known:
             new.context_window = known
         elif context_window_for(cfg.model):
@@ -148,7 +158,7 @@ def candidate(cfg: Any, provider: str, model: str, key: str) -> Any:
     if known:
         new.context_window = known
     if preset is not None:
-        new.desk_model = preset.desk_model
+        new.desk_model = desk_model_for(provider, model)
     return new
 
 
@@ -235,8 +245,10 @@ def apply(loop: Any) -> bool:
         return False
     loop.pending_model = None
     cfg = loop.cfg
-    rebuild = (pending.provider, pending.llm_api_key, pending.llm_base_url) != (
-        cfg.provider, cfg.llm_api_key, cfg.llm_base_url)
+    # The provider, key and endpoint -- and the API family, which on `reynolds` the
+    # model decides: GPT and Claude are two clients there, at two routes of the same
+    # service, so a switch between them is a new client even with nothing else moved.
+    rebuild = endpoint_key(pending, pending.model) != endpoint_key(cfg, cfg.model)
     model_changed = pending.model != cfg.model
     cfg.provider = pending.provider
     cfg.model = pending.model
@@ -260,8 +272,17 @@ def apply(loop: Any) -> bool:
         for latch in ("lean", "legacy_max_tokens"):
             if getattr(loop.provider, latch, False):
                 setattr(loop.provider, latch, False)
+        # And the pin a safety refusal made (`Provider.with_fallback`): the person
+        # naming a model is asking for that model, not for where its refusals went.
+        pins = getattr(loop.provider, "pinned", None)
+        if isinstance(pins, dict):
+            pins.clear()
     loop.window = cfg.context_window or CONTEXT_WINDOW_TOKENS
-    if model_changed:
+    if model_changed or rebuild:
+        # A reasoning block is signed by the deployment that wrote it. Another model
+        # cannot use it, and neither can the same model id behind another endpoint --
+        # a vendor's own API and a gateway or the service's Bedrock proxy in front of
+        # the same family -- so a new client is a new start for reasoning too.
         strip_thinking(loop.messages)
     loop.store.session.model = cfg.model
     # With the model, because neither is worth anything without the other: a resume

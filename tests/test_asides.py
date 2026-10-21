@@ -24,15 +24,70 @@ def make_loop(ctx, store, view):
 # -- typed while the model is working ------------------------------------------
 
 
-def test_an_aside_typed_mid_turn_goes_to_the_model(ctx, store, view):
+class _Side:
+    """Stands in for `desk.SideChat`: records what it was asked."""
+
+    def __init__(self):
+        self.asked = []
+
+    def ask(self, question, wait=False):
+        self.asked.append(question)
+
+
+def test_a_side_question_typed_mid_turn_never_goes_to_the_model(ctx, store, view):
+    """`/btw <question>` is a side question: it goes to the side chat, which answers it
+    apart from the conversation, and nothing of it rides to the model."""
     loop = make_loop(ctx, store, view)
     browser = Browser(ctx.backend, store)
-    reader = ScriptedReader(["/btw the inlet looks like mm/s"])
+    reader = ScriptedReader(["/btw the inlet looks like mm/s?"])
+    side = _Side()
 
-    said = cli._typed_while_working(loop, view, browser, store, reader)
+    said = cli._typed_while_working(loop, view, browser, store, reader, side=side)
 
-    assert said and "mm/s" in said
-    assert said.startswith("By the way")
+    assert said is None
+    assert side.asked == ["the inlet looks like mm/s?"]
+    assert view.receipts == [], "a side question is not queued for the agent"
+
+
+def test_a_side_question_with_side_questions_off_says_so(ctx, store, view):
+    loop = make_loop(ctx, store, view)
+    reader = ScriptedReader(["/btw how far along?"])
+
+    said = cli._typed_while_working(loop, view, Browser(ctx.backend, store), store, reader)
+
+    assert said is None
+    assert view.statuses and "side questions are off" in view.statuses[0][0]
+
+
+def test_bare_btw_mid_turn_is_status(ctx, store, view):
+    loop = make_loop(ctx, store, view)
+    side = _Side()
+
+    said = cli._typed_while_working(loop, view, Browser(ctx.backend, store), store,
+                                    ScriptedReader(["/btw"]), side=side)
+
+    assert said is None and side.asked == []
+    assert view.statuses and view.statuses[0][0].startswith("study ")
+
+
+def test_a_message_typed_mid_turn_gets_a_receipt_at_once(ctx, store, view):
+    """The front desk used to answer it with a cheaper model; now nothing answers in
+    the agent's place, and the receipt is what keeps the screen from going quiet."""
+    from openreynolds.progress import Progress
+
+    class Bar:
+        def snapshot(self):
+            return Progress("solving", "solving cavity · Time 0.4 / 1 s · 3 min", "", 0.4, True)
+
+    loop = make_loop(ctx, store, view)
+    said = cli._typed_while_working(loop, view, Browser(ctx.backend, store), store,
+                                    ScriptedReader(["use the coarse mesh"]), progress=Bar())
+
+    assert said == "use the coarse mesh"
+    (receipt,) = view.receipts
+    assert receipt.startswith("queued: the agent reads this at its next step")
+    assert "solving cavity · Time 0.4 / 1 s · 3 min" in receipt
+    assert "/btw <question>" in receipt
 
 
 def test_a_plain_remark_typed_mid_turn_goes_through_unchanged(ctx, store, view):
@@ -95,12 +150,12 @@ def test_exit_typed_mid_turn_is_left_for_the_session_loop(ctx, store, view):
     assert reader.poll() == "/exit"
 
 
-def test_the_loop_carries_an_aside_into_the_next_message(ctx, store, view):
+def test_the_loop_carries_a_remark_into_the_next_message(ctx, store, view):
     """The mechanism, end to end: tool results have to come first, but a text block
     may follow them, and that is how a mid-turn remark lands at the next step."""
     loop = make_loop(ctx, store, view)
     browser = Browser(ctx.backend, store)
-    reader = ScriptedReader(["/btw coarse is enough"])
+    reader = ScriptedReader(["coarse is enough"])
     loop.interject = lambda: cli._typed_while_working(loop, view, browser, store, reader)
     ctx.backend.files["/work/log"] = b"Time = 1\n"
 

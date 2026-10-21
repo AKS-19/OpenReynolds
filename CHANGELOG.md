@@ -6,6 +6,58 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A session's system prompt and tool list no longer change mid-conversation.** A study
+  whose solver is `auto` used to start the agent on a solver-choosing prompt with only
+  `choose_solver`, and swap both once it was called; through the service's Bedrock
+  proxy the next request was a 400 (a thinking block is bound to the prompt and tools
+  it was made under) and the turn ended with nothing said. The solver is now chosen
+  from the person's first message by a request of its own, before the agent's first
+  turn (`desk.route`); the agent starts on that solver's prompt and tools, and the
+  choice and its reason are told to the person and in the briefing. A routing request
+  that fails leaves the study on OpenFOAM, said so. `choose_solver`,
+  `SOLVER_CHOICE_PROMPT` and the swap are gone.
+- **`/btw <question>` is a side question.** Answered by a fork of the agent's last
+  request -- same model, prompt, tools, settings and messages, one message appended, so
+  it reads the conversation from the prompt cache -- and never added to the
+  conversation. It may run `read_file`, a non-waiting `job_check` and `send_to_agent`,
+  which passes the person's own words to the agent at its next step; any other call is
+  not run. `send_to_agent` is in every tool list for that reason. Bare `/btw` is still
+  `/status`; the "By the way, no need to stop" framing is gone.
+- **The front desk is gone.** Nothing answers a mid-turn message in the agent's place.
+  A message typed mid-turn gets a receipt at once (queued, what the agent is doing and
+  for how long, `/btw` for a side question), held waits ask after the person every
+  second rather than every five, and the "what's happening now" line is built from the
+  tracker's job facts with no model call. `desk_model` is still read and switched, for
+  the configurations and the hosted app that set it.
+- **`/mode` no longer changes the tool list.** `checkpoint` is in every mode's list and
+  answers outside structured mode that checkpoints are structured mode's; the switch
+  reaches the model as a harness note, as it already did. The system prompt never
+  carried the mode. Structured mode still holds `job_start` until a plan is approved.
+- **Reasoning blocks follow what they are bound to.** Measured with the binding checked
+  strictly: a thinking block is bound to the system prompt, the tools and the messages
+  before it (an edited earlier message is the same 400; effort and model changes are
+  not). Image eviction and `drop_images` rewrite an earlier message, so the turns after
+  it lose their thinking blocks; a `/model` switch that rebuilds the client strips them
+  even when the model id is unchanged.
+- **A failed model request is in the transcript.** A turn a provider error ended leaves
+  an `event` row saying the request failed and why, not only a live notice.
+
+### Added
+
+- **Felix mode: a second solver.** `--solver auto|openfoam|felix` (or
+  `OPENREYNOLDS_SOLVER`). With `auto`, the default, the agent's first decision is the
+  solver (`choose_solver`), and the workspace -- of that solver's kind -- is reserved
+  and started, and the platform's study opened with that solver, only once it has
+  chosen. A Felix study gets its own system prompt (pointing at `/opt/felix/docs`), no
+  `cad`, `mesh_review` or OpenFOAM toolbox, and a `job_start` that runs `felix run`
+  without the OpenFOAM restart guard and trapFpe check. The solver is fixed for the
+  whole study and recorded in `session.json`; a resume keeps it. The OpenFOAM prompt
+  is unchanged byte for byte.
+
+## [0.3.2] - 2026-10-05
+
 ### Fixed
 
 - **A `bash` command the workspace moved to a job no longer comes back as `exit_code:
@@ -328,6 +380,41 @@ All notable changes to this project are recorded here. The format follows
   and a study with no row on the platform, list exactly as before.
 
 ### Changed
+
+- **Reynolds' model is GPT or Claude, and the model picks the API.** The `reynolds`
+  preset was Claude 5 over the Messages API at `{service}/v1/llm`. The service now
+  meters four models for a study, two per family: `gpt-6.1-sol` (the default) and
+  `gpt-6-astra` over the Responses API at `{service}/v1/llm/v1` (the client appends
+  `/responses`), and `claude-sonnet-5-5` and `claude-opus-5-5` over the Messages API at
+  `{service}/v1/llm` as before -- all on the service key as the model key, whatever
+  model key the config still holds. `make_provider` picks the adapter from the model,
+  not the preset (a `claude-` id is the Messages API), and each place that builds a
+  client builds it for the model it will ask: the loop, the CAD desk, its reviewer and
+  the front desk. The front desk speaks the main model's family -- `gpt-6-luna` for GPT,
+  `claude-haiku-4-5` for Claude -- and a `/model` between families on `reynolds`
+  rebuilds the client, moves the desk, and replays the thread through neutral blocks,
+  dropping the other family's reasoning. A refusal is retried on the other model of the
+  same family, never across. The window is the model's: 1,000,000 for the Claude 5.5
+  models, and 272,000 for GPT -- not those models' own, but where they start billing at
+  a long-context rate the service does not price -- so a GPT thread is compacted before
+  it gets there. The CAD desk builds with the main model. On GPT that is measured:
+  `gpt-6.1-sol`'s first corpus (`docs/cad-buildup/sweeps/core-gpt-6.1-sol-20261002-075149-9301`)
+  had 22 of 26 survive the vet, against 16 of 26 for gpt-5.6-sol. Neither Claude 5.5
+  model has been swept on the desk (Sonnet 5 finished 0 of 16 in its 30 steps). A
+  config file or a study that names `claude-sonnet-5` or `claude-opus-5` under
+  `reynolds` loads, or resumes, onto `claude-sonnet-5-5` or `claude-opus-5-5`, and any
+  other id the service does not meter onto `gpt-6.1-sol`, and says so.
+
+  The Messages adapter now sends Claude 5.5 only what it accepts. Thinking is adaptive
+  with `display: "summarized"` and the effort is sent on every turn, because Opus 5.5
+  cannot turn thinking off and defaults to `medium`; even on an endpoint that refused
+  the extras, a 5.5 model keeps its effort. The front desk's short answers ask a 5.5
+  model for `low` effort -- with `thinking: {type: "between_tools"}` on Sonnet 5.5, and
+  room for the thinking it cannot skip on Opus 5.5 -- rather than `thinking: disabled`,
+  which both refuse. No path sends a forced `tool_choice`, sampling parameters or a
+  prefill. Responses usage now counts a reported cache write as its own class, and list
+  prices for all seven models are in `llm/presets.py` (Claude's at Anthropic's list;
+  Bedrock bills at partner prices that may differ).
 
 - **The mesh desk builds in the background.** A `mesh` call used to run the desk on
   the loop's own thread and hold it for the whole build. Measured in production
@@ -995,7 +1082,8 @@ on 2026-08-24:
 - A duplicate copy of the architecture notes at the repository root is gone; the one
   under the toolbox notes is the one that ships.
 
-[Unreleased]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/InviscidAI/OpenReynolds/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/InviscidAI/OpenReynolds/compare/v0.1.0...v0.2.0
