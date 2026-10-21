@@ -145,12 +145,13 @@ def test_the_prompt_says_a_study_has_a_directory_of_its_own():
 
 # -- Felix mode (docs/felix-mode-acceptance.md, A2) ------------------------------
 
-OPENFOAM_PROMPT_SHA256 = "4c3406a11756d284c19b2c2708eed9578fe2286ef6826a5890eb120136d7b50b"
-"""The OpenFOAM prompt as it was before Felix mode. It is the cache prefix of every
-OpenFOAM study, and a second solver is no reason for it to move by one byte."""
+OPENFOAM_PROMPT_SHA256 = "28fd68e9c109343984ca18e93e9d350c59cc72e37d55113800b1eef12e59236b"
+"""The OpenFOAM prompt, pinned. It is the cache prefix of every OpenFOAM study, so it
+moves only on purpose: not for a second solver (Felix mode left it byte-identical),
+and last when the "searchable" claim with no search tool behind it came out (#27)."""
 
 
-def test_the_openfoam_prompt_is_byte_identical_to_before_felix():
+def test_the_openfoam_prompt_moves_only_on_purpose():
     import hashlib
 
     assert hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest() == OPENFOAM_PROMPT_SHA256
